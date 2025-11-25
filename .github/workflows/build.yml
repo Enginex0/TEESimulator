@@ -1,0 +1,131 @@
+name: Build
+
+on:
+  push:
+    branches: [ "main" ]
+    paths-ignore:
+      - '**.md'
+      - '.github/**'
+      - '!.github/workflows/**'
+  pull_request:
+    branches: [ "main" ]
+    paths-ignore:
+      - '**.md'
+      - '.github/**'
+      - '!.github/workflows/**'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      attestations: write
+      contents: read
+    
+    outputs:
+      releaseName: ${{ steps.prepareArtifact.outputs.releaseName }}
+      debugName: ${{ steps.prepareArtifact.outputs.debugName }}
+    
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          submodules: "recursive"
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: 'gradle'
+
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ccache-${{ runner.os }}-${{ github.ref_name }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ github.ref_name }}
+            ccache-${{ runner.os }}-
+            ccache-
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build with Gradle
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --parallel zipRelease zipDebug --stacktrace
+
+      - name: Prepare artifact
+        if: success()
+        id: prepareArtifact
+        run: |
+          set -e
+          RELEASE_FILE=$(find out -name "*Release*.zip" | head -1)
+          DEBUG_FILE=$(find out -name "*Debug*.zip" | head -1)
+          
+          if [[ -z "$RELEASE_FILE" || -z "$DEBUG_FILE" ]]; then
+            echo "Error: Could not find release or debug files in out/"
+            echo "Contents of out/ directory:"
+            ls -la out/ || echo "out/ directory does not exist"
+            exit 1
+          fi
+          
+          # Extract names
+          RELEASE_NAME=$(basename "$RELEASE_FILE" .zip)
+          DEBUG_NAME=$(basename "$DEBUG_FILE" .zip)
+          
+          echo "releaseName=$RELEASE_NAME" >> $GITHUB_OUTPUT
+          echo "debugName=$DEBUG_NAME" >> $GITHUB_OUTPUT
+
+          mkdir -p module-release module-debug
+          unzip -q "$RELEASE_FILE" -d module-release
+          unzip -q "$DEBUG_FILE" -d module-debug
+          echo "  Release: $RELEASE_NAME"
+          echo "  Debug: $DEBUG_NAME"
+
+      - name: Upload release
+        if: success()
+        id: release
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prepareArtifact.outputs.releaseName }}
+          path: "./module-release/*"
+          retention-days: 30
+          compression-level: 6
+
+      - name: Upload debug
+        if: success()
+        id: debug
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prepareArtifact.outputs.debugName }}
+          path: "./module-debug/*"
+          retention-days: 7
+          compression-level: 6
+
+      - name: Upload release mappings
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-mappings-${{ github.run_number }}
+          path: "./app/build/outputs/mapping/release"
+          retention-days: 30
+          compression-level: 9
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Gradle Tasks**: assembleRelease, assembleDebug" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ job.status }}" == "success" ]]; then
+            echo "- **Release Artifact**: ${{ steps.prepareArtifact.outputs.releaseName }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Debug Artifact**: ${{ steps.prepareArtifact.outputs.debugName }}" >> $GITHUB_STEP_SUMMARY
+          fi

@@ -5,9 +5,11 @@ import android.os.Build
 import android.os.SystemProperties
 import java.security.MessageDigest
 import java.util.concurrent.ThreadLocalRandom
+import org.bouncycastle.asn1.ASN1EncodableVector
 import org.bouncycastle.asn1.ASN1Integer
 import org.bouncycastle.asn1.DEROctetString
 import org.bouncycastle.asn1.DERSequence
+import org.bouncycastle.asn1.DERSet
 import org.matrix.TEESimulator.attestation.DeviceAttestationService
 import org.matrix.TEESimulator.config.ConfigurationManager
 import org.matrix.TEESimulator.logging.SystemLogger
@@ -278,11 +280,7 @@ object AndroidDeviceUtils {
                         @Suppress("DEPRECATION")
                         pm?.getInstalledPackages(PackageManager.MATCH_APEX, 0)
                     }
-                packages
-                    ?.list
-                    .orEmpty()
-                    .map { it.packageName to it.longVersionCode }
-                    .sortedBy { it.first }
+                packages?.list.orEmpty().map { it.packageName to it.longVersionCode }
             }
             .getOrElse {
                 SystemLogger.error("Failed to get APEX package information.", it)
@@ -291,17 +289,33 @@ object AndroidDeviceUtils {
     }
 
     val moduleHash: ByteArray by lazy {
-        runCatching {
-                val encodables =
-                    apexInfos.flatMap { (packageName, versionCode) ->
-                        listOf(DEROctetString(packageName.toByteArray()), ASN1Integer(versionCode))
+        DeviceAttestationService.CachedAttestationData?.moduleHash
+            ?: runCatching {
+                    // TODO: figure out the correct calculation
+                    val moduleSequences = ASN1EncodableVector()
+
+                    // 1. Create a DERSequence for each module.
+                    apexInfos.forEach { (packageName, versionCode) ->
+                        val moduleVector = ASN1EncodableVector()
+                        // Use explicit UTF-8 encoding for the package name.
+                        moduleVector.add(DEROctetString(packageName.toByteArray(Charsets.UTF_8)))
+                        moduleVector.add(ASN1Integer(versionCode))
+                        moduleSequences.add(DERSequence(moduleVector))
                     }
-                val sequence = DERSequence(encodables.toTypedArray())
-                MessageDigest.getInstance("SHA-256").digest(sequence.encoded)
-            }
-            .getOrElse {
-                SystemLogger.error("Failed to compute module hash.", it)
-                ByteArray(32) // Return empty hash on failure
-            }
+
+                    // 2. Create a DERSet. Bouncy Castle will automatically handle
+                    //    the sorting based on the DER-encoded value of each sequence.
+                    val modulesSet = DERSet(moduleSequences)
+
+                    // 3. Get the final DER-encoded byte array of the SET.
+                    val encodedModules = modulesSet.encoded
+
+                    // 4. Compute the SHA-256 hash.
+                    MessageDigest.getInstance("SHA-256").digest(encodedModules)
+                }
+                .getOrElse {
+                    SystemLogger.error("Failed to compute module hash.", it)
+                    ByteArray(32) // Return empty hash on failure
+                }
     }
 }

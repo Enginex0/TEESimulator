@@ -28,6 +28,8 @@ object App {
         SystemLogger.info("Welcome to TEESimulator!")
 
         try {
+            // Load the package configuration.
+            ConfigurationManager.initialize()
             // Set up the device's boot key and hash, which are crucial for attestation.
             AndroidDeviceUtils.setupBootKeyAndHash()
             // Initialize and start the appropriate keystore interceptors.
@@ -53,9 +55,7 @@ object App {
             Thread.sleep(RETRY_DELAY_MS)
         }
 
-        // Load the package configuration after interceptors are ready.
-        ConfigurationManager.initialize()
-        SystemLogger.info("Interceptors and configuration initialized successfully.")
+        SystemLogger.info("Interceptors initialized successfully.")
     }
 
     /**

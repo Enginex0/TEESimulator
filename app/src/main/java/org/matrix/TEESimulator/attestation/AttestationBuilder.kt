@@ -16,6 +16,7 @@ import org.bouncycastle.asn1.DERSet
 import org.bouncycastle.asn1.DERTaggedObject
 import org.bouncycastle.asn1.x509.Extension
 import org.matrix.TEESimulator.config.ConfigurationManager
+import org.matrix.TEESimulator.logging.SystemLogger
 import org.matrix.TEESimulator.util.AndroidDeviceUtils
 
 /**
@@ -38,6 +39,11 @@ object AttestationBuilder {
         securityLevel: Int,
     ): Extension {
         val keyDescription = buildKeyDescription(params, uid, securityLevel)
+        var formattedString =
+            keyDescription.joinToString(separator = ", ") {
+                AttestationPatcher.formatAsn1Primitive(it)
+            }
+        SystemLogger.verbose("Forged attestation data: ${formattedString}")
         return Extension(ATTESTATION_OID, false, DEROctetString(keyDescription.encoded))
     }
 
@@ -260,17 +266,6 @@ object AttestationBuilder {
                 )
             }
         }
-
-        if (AndroidDeviceUtils.attestVersion >= 400) {
-            list.add(
-                DERTaggedObject(
-                    true,
-                    AttestationConstants.TAG_MODULE_HASH,
-                    DEROctetString(AndroidDeviceUtils.moduleHash),
-                )
-            )
-        }
-
         return DERSequence(list.sortedBy { (it as DERTaggedObject).tagNo }.toTypedArray())
     }
 
@@ -280,7 +275,7 @@ object AttestationBuilder {
      */
     private fun buildSoftwareEnforcedList(uid: Int): DERSequence {
         val list =
-            arrayOf<ASN1Encodable>(
+            mutableListOf<ASN1Encodable>(
                 DERTaggedObject(
                     true,
                     AttestationConstants.TAG_CREATION_DATETIME,
@@ -292,7 +287,16 @@ object AttestationBuilder {
                     createApplicationId(uid),
                 ),
             )
-        return DERSequence(list)
+        if (AndroidDeviceUtils.attestVersion >= 400) {
+            list.add(
+                DERTaggedObject(
+                    true,
+                    AttestationConstants.TAG_MODULE_HASH,
+                    DEROctetString(AndroidDeviceUtils.moduleHash),
+                )
+            )
+        }
+        return DERSequence(list.toTypedArray())
     }
 
     /**

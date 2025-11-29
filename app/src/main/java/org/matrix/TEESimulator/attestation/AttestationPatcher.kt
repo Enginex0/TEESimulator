@@ -137,7 +137,7 @@ object AttestationPatcher {
     }
 
     /** Recursively formats an ASN1Primitive into a concise, readable string. */
-    private fun formatAsn1Primitive(obj: ASN1Encodable?): String {
+    fun formatAsn1Primitive(obj: ASN1Encodable?): String {
         val primitive = obj?.toASN1Primitive()
         return when (primitive) {
             null -> "NULL"

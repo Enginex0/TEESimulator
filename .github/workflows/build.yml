@@ -60,7 +60,8 @@ jobs:
       - name: Build with Gradle
         run: |
           chmod +x ./gradlew
-          ./gradlew --parallel zipRelease zipDebug --stacktrace
+
+          ./gradlew zipRelease zipDebug -Porg.gradle.parallel=true -Porg.gradle.vfs.watch=true -Dorg.gradle.jvmargs=-Xmx2048m
 
       - name: Prepare artifact
         if: success()

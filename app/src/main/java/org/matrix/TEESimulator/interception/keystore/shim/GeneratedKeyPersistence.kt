@@ -7,9 +7,12 @@ import java.io.DataOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.IOException
 import java.security.KeyPair
 import java.security.MessageDigest
 import java.security.cert.Certificate
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.locks.ReentrantLock
 import org.matrix.TEESimulator.config.ConfigurationManager.CONFIG_PATH
 import org.matrix.TEESimulator.interception.keystore.KeyIdentifier
 import org.matrix.TEESimulator.logging.SystemLogger
@@ -35,6 +38,13 @@ object GeneratedKeyPersistence {
     private const val FORMAT_VERSION = 1
     private val PERSISTENCE_DIR = File(CONFIG_PATH, "persistent_keys")
 
+    // Per-filename locks to prevent concurrent writes to the same key file
+    private val fileLocks = ConcurrentHashMap<String, ReentrantLock>()
+
+    private fun getLockForKey(filename: String): ReentrantLock {
+        return fileLocks.computeIfAbsent(filename) { ReentrantLock() }
+    }
+
     fun save(
         keyId: KeyIdentifier,
         keyPair: KeyPair,
@@ -48,55 +58,69 @@ object GeneratedKeyPersistence {
         digests: List<Int>,
         isAttestationKey: Boolean,
     ) {
-        runCatching {
-            PERSISTENCE_DIR.mkdirs()
-            val filename = keyFileName(keyId.uid, keyId.alias)
-            val finalFile = File(PERSISTENCE_DIR, filename)
-            val tmpFile = File(PERSISTENCE_DIR, "$filename.tmp")
+        val filename = keyFileName(keyId.uid, keyId.alias)
+        val lock = getLockForKey(filename)
+        SystemLogger.debug("[Persistence] Acquiring lock for $filename")
+        lock.lock()
+        try {
+            SystemLogger.debug("[Persistence] Lock acquired for $filename")
+            runCatching {
+                PERSISTENCE_DIR.mkdirs()
+                val finalFile = File(PERSISTENCE_DIR, filename)
+                val tmpFile = File(PERSISTENCE_DIR, "$filename.tmp")
 
-            try {
-                DataOutputStream(BufferedOutputStream(FileOutputStream(tmpFile))).use { out ->
-                    out.writeInt(FORMAT_VERSION)
-                    out.writeInt(securityLevel)
-                    out.writeInt(keyId.uid)
-                    out.writeUTF(keyId.alias)
-                    out.writeLong(nspace)
-                    out.writeBoolean(isAttestationKey)
-                    out.writeInt(algorithm)
-                    out.writeInt(keySize)
-                    out.writeInt(ecCurve)
+                try {
+                    DataOutputStream(BufferedOutputStream(FileOutputStream(tmpFile))).use { out ->
+                        out.writeInt(FORMAT_VERSION)
+                        out.writeInt(securityLevel)
+                        out.writeInt(keyId.uid)
+                        out.writeUTF(keyId.alias)
+                        out.writeLong(nspace)
+                        out.writeBoolean(isAttestationKey)
+                        out.writeInt(algorithm)
+                        out.writeInt(keySize)
+                        out.writeInt(ecCurve)
 
-                    out.writeInt(purposes.size)
-                    purposes.forEach { out.writeInt(it) }
+                        out.writeInt(purposes.size)
+                        purposes.forEach { out.writeInt(it) }
 
-                    out.writeInt(digests.size)
-                    digests.forEach { out.writeInt(it) }
+                        out.writeInt(digests.size)
+                        digests.forEach { out.writeInt(it) }
 
-                    val pkBytes = keyPair.private.encoded
-                    out.writeInt(pkBytes.size)
-                    out.write(pkBytes)
+                        val pkBytes = keyPair.private.encoded
+                        out.writeInt(pkBytes.size)
+                        out.write(pkBytes)
 
-                    out.writeInt(certChain.size)
-                    certChain.forEach { cert ->
-                        val encoded = cert.encoded
-                        out.writeInt(encoded.size)
-                        out.write(encoded)
+                        out.writeInt(certChain.size)
+                        certChain.forEach { cert ->
+                            val encoded = cert.encoded
+                            out.writeInt(encoded.size)
+                            out.write(encoded)
+                        }
                     }
+                } catch (e: Exception) {
+                    tmpFile.delete()
+                    throw e
                 }
-            } catch (e: Exception) {
-                tmpFile.delete()
-                throw e
-            }
 
-            // Atomic rename — if this fails the tmp is left behind and cleaned on next deleteAll
-            if (!tmpFile.renameTo(finalFile)) {
-                tmpFile.delete()
-                throw IllegalStateException("Failed to atomically rename $tmpFile -> $finalFile")
-            }
+                // Atomic rename — if this fails the tmp is left behind and cleaned on next deleteAll
+                if (!tmpFile.renameTo(finalFile)) {
+                    tmpFile.delete()
+                    throw IllegalStateException("Failed to atomically rename $tmpFile -> $finalFile")
+                }
 
-            SystemLogger.debug("Persisted key: $keyId")
-        }.onFailure { e ->
-            SystemLogger.error("Failed to persist key $keyId", e)
+                // Verify write succeeded - catches disk-full or filesystem errors
+                if (!finalFile.exists() || finalFile.length() < 20) {
+                    throw IOException("File write verification failed - possible disk full")
+                }
+
+                SystemLogger.debug("Persisted key: $keyId")
+            }.onFailure { e ->
+                SystemLogger.error("Failed to persist key $keyId", e)
+            }
+        } finally {
+            lock.unlock()
+            SystemLogger.debug("[Persistence] Lock released for $filename")
         }
     }
 

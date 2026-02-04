@@ -26,16 +26,11 @@ import org.matrix.TEESimulator.logging.SystemLogger
 import org.matrix.TEESimulator.pki.CertificateGenerator
 import org.matrix.TEESimulator.pki.CertificateHelper
 
-/**
- * Intercepts calls to an `IKeystoreSecurityLevel` service (e.g., TEE or StrongBox). This is where
- * the core logic for key generation and import handling for modern Android resides.
- */
 class KeyMintSecurityLevelInterceptor(
     private val original: IKeystoreSecurityLevel,
     private val securityLevel: Int,
 ) : BinderInterceptor() {
 
-    // --- Data Structures for State Management ---
     data class GeneratedKeyInfo(
         val keyPair: KeyPair,
         val nspace: Long,
@@ -177,11 +172,6 @@ class KeyMintSecurityLevelInterceptor(
         return TransactionResult.SkipTransaction
     }
 
-    /**
-     * Handles the `createOperation` transaction. It checks if the operation is for a key that was
-     * generated in software. If so, it creates a software-based operation handler. Otherwise, it
-     * lets the call proceed to the real hardware service.
-     */
     private fun handleCreateOperation(
         txId: Long,
         callingUid: Int,
@@ -222,15 +212,18 @@ class KeyMintSecurityLevelInterceptor(
         return InterceptorUtils.createTypedObjectReply(response)
     }
 
-    /**
-     * Handles the `generateKey` transaction. Based on the configuration for the calling UID, it
-     * either generates a key in software or lets the call pass through to the hardware.
-     */
     private fun handleGenerateKey(callingUid: Int, data: Parcel): TransactionResult {
         return runCatching {
                 data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
                 val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)!!
                 val attestationKey = data.readTypedObject(KeyDescriptor.CREATOR)
+
+                // Reject oversized aliases to prevent binder buffer exhaustion (Issue #109)
+                if (keyDescriptor.alias.length > MAX_ALIAS_LENGTH) {
+                    SystemLogger.warning("Rejecting oversized alias: ${keyDescriptor.alias.length} bytes (max: $MAX_ALIAS_LENGTH)")
+                    return TransactionResult.ContinueAndSkipPost
+                }
+
                 SystemLogger.debug(
                     "Handling generateKey ${keyDescriptor.alias}, attestKey=${attestationKey?.alias}"
                 )
@@ -241,8 +234,6 @@ class KeyMintSecurityLevelInterceptor(
                     parsedParams.purpose.size == 1 &&
                         parsedParams.purpose.contains(KeyPurpose.ATTEST_KEY)
 
-                // Determine if we need to generate a key based on config or
-                // if it's an attestation request in patch mode.
                 val needsSoftwareGeneration =
                     ConfigurationManager.shouldGenerate(callingUid) ||
                         (ConfigurationManager.shouldPatch(callingUid) && isAttestKeyRequest) ||
@@ -255,7 +246,6 @@ class KeyMintSecurityLevelInterceptor(
                         "Generating software key for ${keyDescriptor.alias}[${keyDescriptor.nspace}]."
                     )
 
-                    // Generate the key pair and certificate chain.
                     val keyData =
                         CertificateGenerator.generateAttestedKeyPair(
                             callingUid,
@@ -265,9 +255,7 @@ class KeyMintSecurityLevelInterceptor(
                             securityLevel,
                         ) ?: throw Exception("CertificateGenerator failed to create key pair.")
 
-                    // It is unnecessary but a good practice to clean up possible caches
                     cleanupKeyData(keyId)
-                    // Store the generated key data.
                     val response =
                         buildKeyEntryResponse(keyData.second, parsedParams, keyDescriptor)
                     generatedKeys[keyId] =
@@ -275,19 +263,24 @@ class KeyMintSecurityLevelInterceptor(
                     if (isAttestKeyRequest) attestationKeys.add(keyId)
 
                     GeneratedKeyPersistence.save(
-                        keyId, keyData.first, keyDescriptor.nspace, securityLevel,
-                        keyData.second, parsedParams.algorithm, parsedParams.keySize,
-                        parsedParams.ecCurve, parsedParams.purpose, parsedParams.digest,
-                        isAttestKeyRequest,
+                        keyId = keyId,
+                        keyPair = keyData.first,
+                        nspace = keyDescriptor.nspace,
+                        securityLevel = securityLevel,
+                        certChain = keyData.second.toList(),
+                        algorithm = parsedParams.algorithm,
+                        keySize = parsedParams.keySize,
+                        ecCurve = parsedParams.ecCurve,
+                        purposes = parsedParams.purpose,
+                        digests = parsedParams.digest,
+                        isAttestationKey = isAttestKeyRequest,
                     )
 
-                    // Return the metadata of our generated key, skipping the real hardware call.
                     return InterceptorUtils.createTypedObjectReply(response.metadata)
                 } else if (parsedParams.attestationChallenge != null) {
                     return TransactionResult.Continue
                 }
 
-                // If not generating, clear any stale state for this alias and let the call proceed.
                 cleanupKeyData(keyId)
                 TransactionResult.ContinueAndSkipPost
             }
@@ -297,9 +290,6 @@ class KeyMintSecurityLevelInterceptor(
             }
     }
 
-    /**
-     * Constructs a fake `KeyEntryResponse` that mimics a real response from the Keystore service.
-     */
     private fun buildKeyEntryResponse(
         chain: List<Certificate>,
         params: KeyMintAttestation,
@@ -319,33 +309,33 @@ class KeyMintSecurityLevelInterceptor(
     }
 
     fun loadPersistedKeys() {
-        val entries = GeneratedKeyPersistence.loadAll(securityLevel)
-        if (entries.isEmpty()) {
+        val records = GeneratedKeyPersistence.loadAll(securityLevel)
+        if (records.isEmpty()) {
             SystemLogger.debug("No persisted keys to restore for security level $securityLevel")
             return
         }
 
-        SystemLogger.info("Restoring ${entries.size} persisted keys for security level $securityLevel")
+        SystemLogger.info("Restoring ${records.size} persisted keys for security level $securityLevel")
 
-        for (data in entries) {
+        for (record in records) {
             runCatching {
-                val keyId = KeyIdentifier(data.uid, data.alias)
+                val keyId = KeyIdentifier(record.uid, record.alias)
                 if (generatedKeys.containsKey(keyId)) {
                     SystemLogger.debug("Skipping already-loaded key: $keyId")
                     return@runCatching
                 }
 
-                val algorithmName = when (data.algorithm) {
+                val algorithmName = when (record.algorithm) {
                     Algorithm.EC -> "EC"
                     Algorithm.RSA -> "RSA"
-                    else -> throw IllegalArgumentException("Unknown algorithm: ${data.algorithm}")
+                    else -> throw IllegalArgumentException("Unknown algorithm: ${record.algorithm}")
                 }
 
                 val keyFactory = KeyFactory.getInstance(algorithmName)
-                val privateKey = keyFactory.generatePrivate(PKCS8EncodedKeySpec(data.privateKeyBytes))
+                val privateKey = keyFactory.generatePrivate(PKCS8EncodedKeySpec(record.privateKeyBytes))
 
                 val certFactory = CertificateFactory.getInstance("X.509")
-                val certChain = data.certChainBytes.map { bytes ->
+                val certChain = record.certChainBytes.map { bytes ->
                     certFactory.generateCertificate(ByteArrayInputStream(bytes))
                 }
                 require(certChain.isNotEmpty()) { "Persisted key has empty certificate chain" }
@@ -355,20 +345,20 @@ class KeyMintSecurityLevelInterceptor(
 
                 val descriptor = KeyDescriptor().apply {
                     domain = Domain.APP
-                    nspace = data.nspace
-                    alias = data.alias
+                    nspace = record.nspace
+                    alias = record.alias
                     blob = null
                 }
 
                 val attestation = KeyMintAttestation(
-                    keySize = data.keySize,
-                    algorithm = data.algorithm,
-                    ecCurve = data.ecCurve,
+                    keySize = record.keySize,
+                    algorithm = record.algorithm,
+                    ecCurve = record.ecCurve,
                     ecCurveName = "",
                     blockMode = emptyList(),
                     padding = emptyList(),
-                    purpose = data.purposes,
-                    digest = data.digests,
+                    purpose = record.purposes,
+                    digest = record.digests,
                     rsaPublicExponent = null,
                     certificateSerial = null,
                     certificateSubject = null,
@@ -387,12 +377,12 @@ class KeyMintSecurityLevelInterceptor(
                 )
 
                 val response = buildKeyEntryResponse(certChain, attestation, descriptor)
-                generatedKeys[keyId] = GeneratedKeyInfo(keyPair, data.nspace, response)
-                if (data.isAttestationKey) attestationKeys.add(keyId)
+                generatedKeys[keyId] = GeneratedKeyInfo(keyPair, record.nspace, response)
+                if (record.isAttestationKey) attestationKeys.add(keyId)
 
                 SystemLogger.debug("Restored persisted key: $keyId")
             }.onFailure {
-                SystemLogger.error("Failed to restore key: uid=${data.uid} alias=${data.alias}", it)
+                SystemLogger.error("Failed to restore key: uid=${record.uid} alias=${record.alias}", it)
             }
         }
 
@@ -402,7 +392,10 @@ class KeyMintSecurityLevelInterceptor(
     companion object {
         private val secureRandom = SecureRandom()
 
-        // Transaction codes for IKeystoreSecurityLevel interface.
+        // Maximum alias length to prevent binder buffer exhaustion (Issue #109)
+        // Binder buffer is ~1MB; 256KB provides 4x safety margin for transaction overhead
+        private const val MAX_ALIAS_LENGTH = 256 * 1024
+
         private val GENERATE_KEY_TRANSACTION =
             InterceptorUtils.getTransactCode(IKeystoreSecurityLevel.Stub::class.java, "generateKey")
         private val IMPORT_KEY_TRANSACTION =
@@ -424,30 +417,16 @@ class KeyMintSecurityLevelInterceptor(
                 .associate { field -> (field.get(null) as Int) to field.name.split("_")[1] }
         }
 
-        // Stores keys generated entirely in software.
         val generatedKeys = ConcurrentHashMap<KeyIdentifier, GeneratedKeyInfo>()
-        // Caches patched certificate chains to prevent re-generation and signature inconsistencies.
+        // Caches patched chains to prevent re-generation and signature inconsistencies
         private val patchedChains = ConcurrentHashMap<KeyIdentifier, Array<Certificate>>()
-        // A set to quickly identify keys that were generated for attestation purposes.
         private val attestationKeys = ConcurrentHashMap.newKeySet<KeyIdentifier>()
-        // Stores interceptors for active cryptographic operations.
         private val interceptedOperations = ConcurrentHashMap<IBinder, OperationInterceptor>()
 
-        // --- Public Accessors for Other Interceptors ---
         fun getGeneratedKeyResponse(keyId: KeyIdentifier): KeyEntryResponse? =
             generatedKeys[keyId]?.response
 
-        /**
-         * Finds a software-generated key by first filtering all known keys by the caller's UID, and
-         * then matching the specific nspace.
-         *
-         * @param callingUid The UID of the process that initiated the createOperation call.
-         * @param nspace The unique key identifier from the operation's KeyDescriptor.
-         * @return The matching GeneratedKeyInfo if found, otherwise null.
-         */
         fun findGeneratedKeyByKeyId(callingUid: Int, nspace: Long?): GeneratedKeyInfo? {
-            // Iterate through all entries in the map to check both the key (for UID) and value (for
-            // nspace).
             if (nspace == null || nspace == 0L) return null
             return generatedKeys.entries
                 .filter { (keyIdentifier, _) -> keyIdentifier.uid == callingUid }
@@ -473,7 +452,6 @@ class KeyMintSecurityLevelInterceptor(
         }
 
         fun removeOperationInterceptor(operationBinder: IBinder, backdoor: IBinder) {
-            // Unregister from the native hook layer first.
             unregister(backdoor, operationBinder)
 
             if (interceptedOperations.remove(operationBinder) != null) {
@@ -501,21 +479,9 @@ class KeyMintSecurityLevelInterceptor(
     }
 }
 
-/**
- * Extension function to convert parsed `KeyMintAttestation` parameters back into an array of
- * `Authorization` objects for the fake `KeyMetadata`. This version correctly handles the
- * instantiation of Authorization objects.
- */
 private fun KeyMintAttestation.toAuthorizations(securityLevel: Int): Array<Authorization> {
     val authList = mutableListOf<Authorization>()
 
-    /**
-     * Helper function to create a fully-formed Authorization object.
-     *
-     * @param tag The KeyMint tag (e.g., Tag.ALGORITHM).
-     * @param value The value for the tag, wrapped in a KeyParameterValue.
-     * @return A populated Authorization object.
-     */
     fun createAuth(tag: Int, value: KeyParameterValue): Authorization {
         val param =
             KeyParameter().apply {
@@ -528,7 +494,6 @@ private fun KeyMintAttestation.toAuthorizations(securityLevel: Int): Array<Autho
         }
     }
 
-    // Use the helper to add each authorization entry cleanly.
     this.purpose.forEach { authList.add(createAuth(Tag.PURPOSE, KeyParameterValue.keyPurpose(it))) }
     this.digest.forEach { authList.add(createAuth(Tag.DIGEST, KeyParameterValue.digest(it))) }
 

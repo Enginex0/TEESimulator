@@ -13,12 +13,10 @@ import java.security.spec.ECGenParameterSpec
 import java.security.spec.RSAKeyGenParameterSpec
 import java.util.Date
 import org.bouncycastle.asn1.x500.X500Name
-import org.bouncycastle.asn1.x509.BasicConstraints
 import org.bouncycastle.asn1.x509.Extension
 import org.bouncycastle.asn1.x509.KeyUsage
 import org.bouncycastle.cert.X509CertificateHolder
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
-import org.bouncycastle.cert.jcajce.JcaX509ExtensionUtils
 import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
 import org.bouncycastle.jce.provider.BouncyCastleProvider
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
@@ -30,8 +28,20 @@ import org.matrix.TEESimulator.interception.keystore.KeyIdentifier
 import org.matrix.TEESimulator.interception.keystore.shim.KeyMintSecurityLevelInterceptor
 import org.matrix.TEESimulator.logging.SystemLogger
 
+/**
+ * Responsible for generating new cryptographic key pairs and X.509 certificate chains.
+ *
+ * This object simulates the behavior of the Android KeyMint/Keymaster HAL by creating certificates
+ * that include a fully-featured, simulated attestation extension.
+ */
 object CertificateGenerator {
 
+    /**
+     * Generates a software-based cryptographic key pair.
+     *
+     * @param params The parameters specifying the key's algorithm, size, and other properties.
+     * @return A new [KeyPair], or `null` on failure.
+     */
     fun generateSoftwareKeyPair(params: KeyMintAttestation): KeyPair? {
         return runCatching {
                 val (algorithm, spec) =
@@ -54,6 +64,17 @@ object CertificateGenerator {
             .getOrNull()
     }
 
+    /**
+     * Generates a certificate chain for a given key pair. This is the primary function for creating
+     * attested certificates.
+     *
+     * @param uid The UID of the application requesting the key.
+     * @param subjectKeyPair The key pair for which the certificate will be generated.
+     * @param attestKeyAlias Optional alias of a key to use for attestation signing.
+     * @param params The parameters for the new key and its attestation.
+     * @param securityLevel The security level to embed in the attestation.
+     * @return A [List] of [Certificate] forming the new chain, or `null` on failure.
+     */
     fun generateCertificateChain(
         uid: Int,
         subjectKeyPair: KeyPair,
@@ -70,26 +91,22 @@ object CertificateGenerator {
         return runCatching {
                 val keybox = getKeyboxForAlgorithm(uid, params.algorithm)
 
-                val (signingKey, issuer, issuerCert) =
+                // Determine the signing key and issuer. If an attestKey is provided, use it.
+                // Otherwise, fall back to the root key from the keybox.
+                val (signingKey, issuer) =
                     if (attestKeyAlias != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                        getAttestationKeyInfo(uid, attestKeyAlias)?.let {
-                            Triple(it.first, it.second, null as X509Certificate?)
-                        } ?: Triple(
-                            keybox.keyPair,
-                            getIssuerFromKeybox(keybox),
-                            keybox.certificates.firstOrNull() as? X509Certificate
-                        )
+                        getAttestationKeyInfo(uid, attestKeyAlias)?.let { it.first to it.second }
+                            ?: (keybox.keyPair to getIssuerFromKeybox(keybox))
                     } else {
-                        Triple(
-                            keybox.keyPair,
-                            getIssuerFromKeybox(keybox),
-                            keybox.certificates.firstOrNull() as? X509Certificate
-                        )
+                        keybox.keyPair to getIssuerFromKeybox(keybox)
                     }
 
+                // Build the new leaf certificate with the simulated attestation.
                 val leafCert =
-                    buildCertificate(subjectKeyPair, signingKey, issuer, issuerCert, params, uid, securityLevel)
+                    buildCertificate(subjectKeyPair, signingKey, issuer, params, uid, securityLevel)
 
+                // If not self-attesting, the chain is just the leaf. Otherwise, append the keybox
+                // chain.
                 if (attestKeyAlias != null) {
                     listOf(leafCert)
                 } else {
@@ -100,6 +117,10 @@ object CertificateGenerator {
             .getOrNull()
     }
 
+    /**
+     * A convenience function that combines key pair generation and certificate chain generation.
+     * Primarily used by the modern Keystore2 interceptor where generation is a single step.
+     */
     fun generateAttestedKeyPair(
         uid: Int,
         alias: String,
@@ -145,9 +166,11 @@ object CertificateGenerator {
             ?: throw Exception("Could not load keybox for UID $uid and algorithm $algorithmName")
     }
 
+    /** Retrieves the key pair and issuer name for a given attestation key alias. */
     private fun getAttestationKeyInfo(uid: Int, attestKeyAlias: String): Pair<KeyPair, X500Name>? {
         SystemLogger.debug("Looking for attestation key: uid=$uid alias=$attestKeyAlias")
         val keyId = KeyIdentifier(uid, attestKeyAlias)
+        // Access the public map of generated keys
         val keyInfo = KeyMintSecurityLevelInterceptor.generatedKeys[keyId]
         return if (keyInfo != null) {
             val certChain = CertificateHelper.getCertificateChain(keyInfo.response)
@@ -165,6 +188,7 @@ object CertificateGenerator {
         }
     }
 
+    /** Maps KeyPurpose values to X.509 KeyUsage bits per KeyCreationResult.aidl spec */
     private fun buildKeyUsageFromPurposes(purposes: List<Int>): Int {
         var bits = 0
         for (purpose in purposes) {
@@ -180,22 +204,19 @@ object CertificateGenerator {
         return bits
     }
 
+    /** Constructs a new X.509 certificate with a simulated attestation extension. */
     private fun buildCertificate(
         subjectKeyPair: KeyPair,
         signingKeyPair: KeyPair,
         issuer: X500Name,
-        issuerCert: X509Certificate?,
         params: KeyMintAttestation,
         uid: Int,
         securityLevel: Int,
     ): Certificate {
-        val subject = params.certificateSubject ?: X500Name("CN=Android Keystore Key")
-        SystemLogger.debug("[CertGen] Subject: $subject")
-        // Real TEEs use 25-30 year validity periods (per AOSP Beanpod KeyMaster observation)
-        val THIRTY_YEARS_MS = 30L * 365 * 24 * 60 * 60 * 1000
-        val leafNotAfter = issuerCert?.notAfter
-            ?: Date(System.currentTimeMillis() + THIRTY_YEARS_MS)
-        SystemLogger.debug("[CertGen] Validity: ${params.certificateNotBefore ?: Date()} to $leafNotAfter")
+        val subject = params.certificateSubject ?: X500Name("CN=Android KeyStore Key")
+        val leafNotAfter =
+            (signingKeyPair.public as? X509Certificate)?.notAfter
+                ?: Date(System.currentTimeMillis() + 31536000000L)
 
         val builder =
             JcaX509v3CertificateBuilder(
@@ -211,33 +232,8 @@ object CertificateGenerator {
         val keyUsageBits = buildKeyUsageFromPurposes(params.purpose)
         if (keyUsageBits != 0) {
             builder.addExtension(Extension.keyUsage, true, KeyUsage(keyUsageBits))
-            SystemLogger.debug("[CertGen] Added KeyUsage extension: bits=0x${keyUsageBits.toString(16)}")
         }
-
-        // RFC 5280 Section 4.2.1.9: end-entity cert must not act as CA
-        builder.addExtension(Extension.basicConstraints, true, BasicConstraints(false))
-        SystemLogger.debug("[CertGen] Added BasicConstraints: CA=false")
-
-        val extUtils = JcaX509ExtensionUtils()
-
-        // RFC 5280 Section 4.2.1.2: SHA-1 hash of subject public key
-        builder.addExtension(
-            Extension.subjectKeyIdentifier,
-            false,
-            extUtils.createSubjectKeyIdentifier(subjectKeyPair.public)
-        )
-        SystemLogger.debug("[CertGen] Added SubjectKeyIdentifier (SKI)")
-
-        // RFC 5280 Section 4.2.1.1: links certificate to issuer's signing key
-        if (issuerCert != null) {
-            builder.addExtension(
-                Extension.authorityKeyIdentifier,
-                false,
-                extUtils.createAuthorityKeyIdentifier(issuerCert)
-            )
-            SystemLogger.debug("[CertGen] Added AuthorityKeyIdentifier (AKI) from issuer")
-        }
-
+        // Add our custom, simulated attestation extension.
         builder.addExtension(
             AttestationBuilder.buildAttestationExtension(params, uid, securityLevel)
         )

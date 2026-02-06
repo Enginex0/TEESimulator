@@ -48,7 +48,7 @@ install_file() {
 
 # --- Installation ---
 ui_print "- Extracting module files"
-for file in customize.sh module.prop service.sh sepolicy.rule daemon; do
+for file in customize.sh module.prop service.sh sepolicy.rule daemon action.sh uninstall.sh; do
   install_file "$file" "$MODPATH"
 done
 

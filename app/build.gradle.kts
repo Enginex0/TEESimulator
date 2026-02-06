@@ -116,7 +116,7 @@ androidComponents {
                     )
                 ) {
                     into("lib") // Place them in the 'lib' subfolder of the staging directory.
-                    include("**/libinject.so", "**/libTEESimulator.so")
+                    include("**/libinject.so", "**/libTEESimulator.so", "**/libsupervisor.so")
                 }
 
                 // Now, copy and process the files from 'module' directory.

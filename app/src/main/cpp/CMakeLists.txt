@@ -22,6 +22,9 @@ add_executable(libinject.so inject/main.cpp inject/utils.cpp)
 target_include_directories(libinject.so PUBLIC include)
 target_link_libraries(libinject.so PRIVATE lsplt_static)
 
+add_executable(libsupervisor.so supervisor.cpp)
+target_link_libraries(libsupervisor.so PRIVATE log)
+
 add_library(${CMAKE_PROJECT_NAME} SHARED binder_interceptor.cpp)
 target_include_directories(${CMAKE_PROJECT_NAME} PUBLIC external/linux-kernel/include include)
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE binder lsplt_static utils)

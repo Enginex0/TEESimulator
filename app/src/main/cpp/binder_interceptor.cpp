@@ -348,13 +348,14 @@ static sp<BinderStub> g_stub_instance = nullptr;
 
 namespace {
 
-/**
- * @brief Analyses a binder transaction. If the target is monitored,
- *        hijacks the transaction by rewriting its destination to our BinderStub.
- * @param txn_data Pointer to the transaction data within the ioctl buffer.
- */
+constexpr binder_size_t kMaxInterceptableDataSize = 256 * 1024;
+
 void inspectAndRewriteTransaction(binder_transaction_data *txn_data) {
     if (!txn_data || txn_data->target.ptr == 0)
+        return;
+
+    // Bypass interception for oversized payloads to prevent thread starvation from flood attacks
+    if (txn_data->data_size > kMaxInterceptableDataSize)
         return;
 
     bool hijack = false;

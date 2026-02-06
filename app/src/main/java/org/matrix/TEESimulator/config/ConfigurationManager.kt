@@ -253,7 +253,14 @@ object ConfigurationManager {
             }
 
             // Parse global and per-package configurations.
-            val newGlobalLevel = parseLines(contextLines[""])
+            var newGlobalLevel = parseLines(contextLines[""])
+            // TrickyAddon writes Pixel bulletin dates for boot/vendor but system=prop
+            // resolves to the real device prop — force boot/vendor through the same path
+            // to prevent cross-component date mismatches on non-Pixel devices.
+            if (newGlobalLevel?.system.equals("prop", ignoreCase = true)) {
+                SystemLogger.info("system=prop: forcing boot/vendor to derive from device props (were: boot=${newGlobalLevel?.boot}, vendor=${newGlobalLevel?.vendor})")
+                newGlobalLevel = newGlobalLevel?.copy(boot = "prop", vendor = "prop")
+            }
             contextLines.remove("") // Remove global context to iterate over packages next
 
             for ((pkg, lines) in contextLines) {

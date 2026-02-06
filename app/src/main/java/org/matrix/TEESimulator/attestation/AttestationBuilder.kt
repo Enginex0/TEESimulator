@@ -112,6 +112,7 @@ object AttestationBuilder {
             }
 
         val bootPatch = AndroidDeviceUtils.getBootPatchLevelLong(uid)
+        SystemLogger.info("Attestation patch levels for uid=$uid: os=$osPatch, vendor=$vendorPatch, boot=$bootPatch")
         properties[AttestationConstants.TAG_BOOT_PATCHLEVEL] =
             if (bootPatch != DO_NOT_REPORT) {
                 DERTaggedObject(

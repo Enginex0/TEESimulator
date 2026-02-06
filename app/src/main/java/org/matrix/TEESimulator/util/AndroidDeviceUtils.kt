@@ -239,11 +239,12 @@ object AndroidDeviceUtils {
         val resolvedValue = resolveDateKeywords(value)
 
         return when {
-            // "device_default" indicates falling back to the system property.
             resolvedValue.equals("device_default", ignoreCase = true) -> null
-            // "no" indicates this value should not be reported.
+            // Resolve from live system prop — matches what detectors see via getprop,
+            // even when PIF has spoofed ro.build.version.security_patch via resetprop
+            resolvedValue.equals("prop", ignoreCase = true) ->
+                parsePatchLevelValue(SystemProperties.get("ro.build.version.security_patch", ""), isLong)
             resolvedValue.equals("no", ignoreCase = true) -> DO_NOT_REPORT
-            // Otherwise, parse the resolved date string.
             else -> parsePatchLevelValue(resolvedValue, isLong)
         }
     }

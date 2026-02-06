@@ -16,6 +16,7 @@ import java.security.cert.Certificate
 import java.security.cert.CertificateFactory
 import java.security.spec.PKCS8EncodedKeySpec
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import org.matrix.TEESimulator.attestation.AttestationPatcher
 import org.matrix.TEESimulator.attestation.KeyMintAttestation
 import org.matrix.TEESimulator.config.ConfigurationManager
@@ -52,7 +53,7 @@ class KeyMintSecurityLevelInterceptor(
             GENERATE_KEY_TRANSACTION -> {
                 logTransaction(txId, transactionNames[code]!!, callingUid, callingPid)
 
-                if (!shouldSkip) return handleGenerateKey(callingUid, data)
+                if (!shouldSkip) return handleGenerateKey(txId, callingUid, data)
             }
             CREATE_OPERATION_TRANSACTION -> {
                 logTransaction(txId, transactionNames[code]!!, callingUid, callingPid)
@@ -93,6 +94,11 @@ class KeyMintSecurityLevelInterceptor(
         reply: Parcel?,
         resultCode: Int,
     ): TransactionResult {
+        if (code == GENERATE_KEY_TRANSACTION && hardwareKeygenTxIds.remove(txId)) {
+            val remaining = hardwareKeygenCount(callingUid).decrementAndGet()
+            SystemLogger.info("[TX_ID: $txId] PERMIT_RELEASED uid=$callingUid concurrent_remaining=$remaining result=${if (resultCode == 0) "OK" else "ERROR($resultCode)"}")
+        }
+
         // We only care about successful transactions.
         if (resultCode != 0 || reply == null || InterceptorUtils.hasException(reply))
             return TransactionResult.SkipTransaction
@@ -104,7 +110,14 @@ class KeyMintSecurityLevelInterceptor(
             val keyDescriptor =
                 data.readTypedObject(KeyDescriptor.CREATOR)
                     ?: return TransactionResult.SkipTransaction
-            cleanupKeyData(KeyIdentifier(callingUid, keyDescriptor.alias))
+            // Evict generated key data but retain patched chains so detectors
+            // can't use importKey to force unpatched getKeyEntry responses.
+            val keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
+            if (generatedKeys.remove(keyId) != null) {
+                SystemLogger.debug("Remove generated key on importKey $keyId")
+                GeneratedKeyPersistence.delete(keyId)
+            }
+            attestationKeys.remove(keyId)
         } else if (code == CREATE_OPERATION_TRANSACTION) {
             logTransaction(txId, "post-${transactionNames[code]!!}", callingUid, callingPid)
 
@@ -212,17 +225,16 @@ class KeyMintSecurityLevelInterceptor(
         return InterceptorUtils.createTypedObjectReply(response)
     }
 
-    private fun handleGenerateKey(callingUid: Int, data: Parcel): TransactionResult {
+    private fun handleGenerateKey(txId: Long, callingUid: Int, data: Parcel): TransactionResult {
+        if (data.dataSize() > MAX_ALIAS_LENGTH) {
+            SystemLogger.warning("Skipping oversized transaction: ${data.dataSize()} bytes")
+            return TransactionResult.ContinueAndSkipPost
+        }
+
         return runCatching {
                 data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
                 val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)!!
                 val attestationKey = data.readTypedObject(KeyDescriptor.CREATOR)
-
-                // Reject oversized aliases to prevent binder buffer exhaustion (Issue #109)
-                if (keyDescriptor.alias.length > MAX_ALIAS_LENGTH) {
-                    SystemLogger.warning("Rejecting oversized alias: ${keyDescriptor.alias.length} bytes (max: $MAX_ALIAS_LENGTH)")
-                    return TransactionResult.ContinueAndSkipPost
-                }
 
                 SystemLogger.debug(
                     "Handling generateKey ${keyDescriptor.alias}, attestKey=${attestationKey?.alias}"
@@ -241,43 +253,26 @@ class KeyMintSecurityLevelInterceptor(
                             isAttestationKey(KeyIdentifier(callingUid, attestationKey.alias)))
 
                 if (needsSoftwareGeneration) {
-                    keyDescriptor.nspace = secureRandom.nextLong()
-                    SystemLogger.info(
-                        "Generating software key for ${keyDescriptor.alias}[${keyDescriptor.nspace}]."
-                    )
-
-                    val keyData =
-                        CertificateGenerator.generateAttestedKeyPair(
-                            callingUid,
-                            keyDescriptor.alias,
-                            attestationKey?.alias,
-                            parsedParams,
-                            securityLevel,
-                        ) ?: throw Exception("CertificateGenerator failed to create key pair.")
-
-                    cleanupKeyData(keyId)
-                    val response =
-                        buildKeyEntryResponse(keyData.second, parsedParams, keyDescriptor)
-                    generatedKeys[keyId] =
-                        GeneratedKeyInfo(keyData.first, keyDescriptor.nspace, response)
-                    if (isAttestKeyRequest) attestationKeys.add(keyId)
-
-                    GeneratedKeyPersistence.save(
-                        keyId = keyId,
-                        keyPair = keyData.first,
-                        nspace = keyDescriptor.nspace,
-                        securityLevel = securityLevel,
-                        certChain = keyData.second.toList(),
-                        algorithm = parsedParams.algorithm,
-                        keySize = parsedParams.keySize,
-                        ecCurve = parsedParams.ecCurve,
-                        purposes = parsedParams.purpose,
-                        digests = parsedParams.digest,
-                        isAttestationKey = isAttestKeyRequest,
-                    )
-
-                    return InterceptorUtils.createTypedObjectReply(response.metadata)
+                    return doSoftwareKeyGen(callingUid, keyDescriptor, attestationKey, parsedParams, keyId, isAttestKeyRequest)
                 } else if (parsedParams.attestationChallenge != null) {
+                    val windowUsed = hardwareKeygenWindowCount(callingUid)
+                    val concurrentUsed = hardwareKeygenCount(callingUid).get()
+
+                    // Sliding window rate limit
+                    if (windowUsed >= MAX_HW_KEYGEN_PER_WINDOW) {
+                        SystemLogger.info("[TX_ID: $txId] RATE_LIMITED uid=$callingUid window=$windowUsed/$MAX_HW_KEYGEN_PER_WINDOW concurrent=$concurrentUsed → software fallback")
+                        return doSoftwareKeyGen(callingUid, keyDescriptor, attestationKey, parsedParams, keyId, isAttestKeyRequest)
+                    }
+                    // Concurrent cap
+                    if (hardwareKeygenCount(callingUid).incrementAndGet() > MAX_CONCURRENT_HW_KEYGEN_PER_UID) {
+                        hardwareKeygenCount(callingUid).decrementAndGet()
+                        SystemLogger.info("[TX_ID: $txId] CONCURRENT_LIMITED uid=$callingUid window=$windowUsed/$MAX_HW_KEYGEN_PER_WINDOW concurrent=${concurrentUsed + 1}/$MAX_CONCURRENT_HW_KEYGEN_PER_UID → software fallback")
+                        return doSoftwareKeyGen(callingUid, keyDescriptor, attestationKey, parsedParams, keyId, isAttestKeyRequest)
+                    }
+                    // Both checks passed — commit the window permit and forward to hardware TEE
+                    recordHardwareKeygen(callingUid)
+                    hardwareKeygenTxIds.add(txId)
+                    SystemLogger.info("[TX_ID: $txId] HARDWARE_KEYGEN uid=$callingUid window=${windowUsed + 1}/$MAX_HW_KEYGEN_PER_WINDOW concurrent=${concurrentUsed + 1}/$MAX_CONCURRENT_HW_KEYGEN_PER_UID → forwarding to TEE")
                     return TransactionResult.Continue
                 }
 
@@ -288,6 +283,43 @@ class KeyMintSecurityLevelInterceptor(
                 SystemLogger.error("Error during generateKey handling for UID $callingUid.", it)
                 TransactionResult.ContinueAndSkipPost
             }
+    }
+
+    private fun doSoftwareKeyGen(
+        callingUid: Int,
+        keyDescriptor: KeyDescriptor,
+        attestationKey: KeyDescriptor?,
+        parsedParams: KeyMintAttestation,
+        keyId: KeyIdentifier,
+        isAttestKeyRequest: Boolean,
+    ): TransactionResult {
+        keyDescriptor.nspace = secureRandom.nextLong()
+        SystemLogger.info("Generating software key for ${keyDescriptor.alias}[${keyDescriptor.nspace}].")
+
+        val keyData = CertificateGenerator.generateAttestedKeyPair(
+            callingUid, keyDescriptor.alias, attestationKey?.alias, parsedParams, securityLevel,
+        ) ?: throw Exception("CertificateGenerator failed to create key pair.")
+
+        cleanupKeyData(keyId)
+        val response = buildKeyEntryResponse(keyData.second, parsedParams, keyDescriptor)
+        generatedKeys[keyId] = GeneratedKeyInfo(keyData.first, keyDescriptor.nspace, response)
+        if (isAttestKeyRequest) attestationKeys.add(keyId)
+
+        GeneratedKeyPersistence.save(
+            keyId = keyId,
+            keyPair = keyData.first,
+            nspace = keyDescriptor.nspace,
+            securityLevel = securityLevel,
+            certChain = keyData.second.toList(),
+            algorithm = parsedParams.algorithm,
+            keySize = parsedParams.keySize,
+            ecCurve = parsedParams.ecCurve,
+            purposes = parsedParams.purpose,
+            digests = parsedParams.digest,
+            isAttestationKey = isAttestKeyRequest,
+        )
+
+        return InterceptorUtils.createTypedObjectReply(response.metadata)
     }
 
     private fun buildKeyEntryResponse(
@@ -395,6 +427,33 @@ class KeyMintSecurityLevelInterceptor(
         // Maximum alias length to prevent binder buffer exhaustion (Issue #109)
         // Binder buffer is ~1MB; 256KB provides 4x safety margin for transaction overhead
         private const val MAX_ALIAS_LENGTH = 256 * 1024
+        private const val MAX_CONCURRENT_HW_KEYGEN_PER_UID = 2
+        // Sliding window: max hardware keygen permits per UID within the burst window
+        private const val MAX_HW_KEYGEN_PER_WINDOW = 2
+        private const val BURST_WINDOW_MS = 30_000L
+
+        private val uidHardwareKeygenCount = ConcurrentHashMap<Int, AtomicInteger>()
+        private val hardwareKeygenTxIds = ConcurrentHashMap.newKeySet<Long>()
+        private val uidKeygenTimestamps = ConcurrentHashMap<Int, MutableList<Long>>()
+
+        private fun hardwareKeygenCount(uid: Int): AtomicInteger =
+            uidHardwareKeygenCount.computeIfAbsent(uid) { AtomicInteger(0) }
+
+        private fun hardwareKeygenWindowCount(uid: Int): Int {
+            val now = System.currentTimeMillis()
+            val timestamps = uidKeygenTimestamps.computeIfAbsent(uid) { mutableListOf() }
+            synchronized(timestamps) {
+                timestamps.removeAll { now - it > BURST_WINDOW_MS }
+                return timestamps.size
+            }
+        }
+
+        private fun recordHardwareKeygen(uid: Int) {
+            val timestamps = uidKeygenTimestamps.computeIfAbsent(uid) { mutableListOf() }
+            synchronized(timestamps) {
+                timestamps.add(System.currentTimeMillis())
+            }
+        }
 
         private val GENERATE_KEY_TRANSACTION =
             InterceptorUtils.getTransactCode(IKeystoreSecurityLevel.Stub::class.java, "generateKey")

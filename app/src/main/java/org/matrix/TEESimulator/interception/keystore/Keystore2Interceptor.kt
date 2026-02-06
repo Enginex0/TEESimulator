@@ -235,8 +235,15 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                         ?.let { it.keyParameter.value.origin }
 
                 if (origin == KeyOrigin.IMPORTED || origin == KeyOrigin.SECURELY_IMPORTED) {
-                    SystemLogger.info("[TX_ID: $txId] Skip patching for imported keys.")
-                    return TransactionResult.SkipTransaction
+                    val keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
+                    val retainedChain = KeyMintSecurityLevelInterceptor.getPatchedChain(keyId)
+                    if (retainedChain == null) {
+                        SystemLogger.info("[TX_ID: $txId] Skip patching for imported key (no prior attestation).")
+                        return TransactionResult.SkipTransaction
+                    }
+                    SystemLogger.info("[TX_ID: $txId] Imported key overwrote attested alias, serving retained chain for $keyId")
+                    CertificateHelper.updateCertificateChain(response.metadata, retainedChain).getOrThrow()
+                    return InterceptorUtils.createTypedObjectReply(response)
                 }
 
                 if (originalChain == null || originalChain.size < 2) {

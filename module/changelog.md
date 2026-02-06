@@ -1,26 +1,43 @@
-## 🎉 TEESimulator v3.1: Legacy Support & Resilience
+## TEESimulator v3.2: Anti-Detection Hardening & Key Persistence
 
-This release marks a significant step forward in our mission, focusing on breathing life into devices with **broken TEEs** and extending full support to older Android versions (**Android 10–12**).
+This release hardens TEESimulator against active attestation probing by detector apps (DuckDetector, Luna, GarfieldHan) while introducing persistent key storage that survives daemon restarts and reboots.
 
-### 🛡️ Enhanced Keystore2 Emulation
-We have implemented critical APIs to support devices where the hardware TEE is broken or for applications configured to use key generation mode. These improvements directly address detection vectors identified in v3.0:
+### Anti-Detection Hardening
 
-*   **✅ Full Crypto Operations (`createOperation`)**: The simulator now correctly handles `SIGN`, `VERIFY`, `ENCRYPT`, and `DECRYPT` purposes for software-generated keys.
-*   **🔗 Certificate Chain Updates (`updateSubcomponent`)**: Added support for applications updating the certificate chain of virtual keys (e.g., via `KeyStore.setKeyEntry`).
-*   **📋 Enumeration Support (`listEntries`)**: Generated keys are now properly visible in enumeration APIs like `KeyStore.aliases()`, thanks to the implementation of `listEntries` and `listEntriesBatched`.
+*   **Per-UID Hardware Keygen Rate Limiter**: Caps hardware key generation at 2 per 30-second window with 2 max concurrent requests per UID. Overflow requests fall back to software certificate generation, preventing binder thread starvation from flood attacks.
+*   **importKey Eviction Defense**: Retains patched attestation chains when `importKey` overwrites an attested alias. Blocks the generate-then-import attack vector used by GarfieldHan and similar detectors.
+*   **Native Binder Payload Cap**: Bypasses interception for payloads exceeding 256KB, preventing thread starvation from oversized binder transactions.
+*   **Oversized Alias Rejection**: Rejects aliases that would exhaust the binder buffer, closing another flooding vector.
 
-### 🔧 Compatibility & Stability
-We’ve ironed out crashes and architecture-specific bugs to ensure a smooth experience across more devices:
+### Security Patch Consistency
 
-*   **Android 10**: Fixed a crash caused by the missing `waitForService` method.
-*   **Android 11**: Implemented environment initialization and daemon UID spoofing to successfully bypass keystore generation permission checks.
-*   **ARM 32-bit (Android 12)**: Resolved `ptrace` compatibility issues by falling back to `PTRACE_GETREGS` and `PTRACE_SETREGS`.
-*   **x86_64 Emulators**: Enforced respect for the stack pointer "red zone" and added a staging fallback mechanism for file descriptor transfering of `libTEESimulator.so`.
+*   **Three-Way Patch Level Alignment**: When `system=prop` in `security_patch.txt`, boot and vendor patch levels are forced to `prop` as well. All three ASN.1 attestation tags (706/718/719) now resolve via `SystemProperties.get()` to match what detector apps see through `getprop`.
 
-### 🚀 The Road Ahead
+### Key Persistence
 
-We are aware of the remaining detection vectors (see the issues list) and have clear solutions mapped out for the next release.
+*   **Generated Key Persistence Layer**: Keys from `generateKey` are persisted to disk in binary format with version headers and atomic writes (tmp + rename).
+*   **Automatic Restoration**: Persisted keys are restored on daemon startup without re-attestation.
+*   **Keybox Rotation Survival**: Generated keys survive keybox.xml changes — only PATCH-mode cert chains are invalidated.
+*   **File-Level Locking**: Concurrent read/write access to persisted keys is serialized to prevent corruption.
 
-Google's aggressive push for **Remote Key Provisioning (RKP)** and the drying up of leaked keyboxes is **not** the end for TEESimulator. Our ultimate goal remains unchanged: defeating Keystore attestation **without relying on a valid keybox**.
+### Process Reliability
 
-We are inching closer to this milestone, but the fight for device freedom is complex and resource-intensive. Your patience and support (both time and financial) are vital as we conquer these new challenges.
+*   **Fork-Based Supervisor Daemon**: Replaces the restart loop with a native fork-based supervisor for near-instant recovery.
+*   **Attestation Leak Blocking**: Returns `DEAD_OBJECT` to callers when the interceptor service is unavailable, preventing unpatched attestation from leaking through.
+*   **Global Exception Handler**: Catches uncaught exceptions and triggers clean daemon restart instead of silent death.
+*   **FileObserver NPE Fix**: Prevents crash when config files are deleted while being observed.
+
+### Upstream Cherry-Picks
+
+*   **KeyUsage per HAL spec** (#119): Correct certificate KeyUsage based on KeyPurpose.
+*   **Reference leak fix** (#122): Resolve strong reference leak and warnings in binder interception.
+
+### Module Lifecycle
+
+*   **`action.sh`**: Purge persistent key storage via KSU Manager Action button. Shows key count and storage size before clearing.
+*   **`uninstall.sh`**: Clean module removal — kills daemon, removes generated data, preserves `target.txt`, `keybox.xml`, and `security_patch.txt`.
+
+### PKI Fixes
+
+*   Strip HTML comments from PEM blocks before parsing.
+

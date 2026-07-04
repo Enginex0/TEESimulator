@@ -25,7 +25,7 @@ abstract class GitExecutor @Inject constructor(private val execOperations: ExecO
     }
 }
 
-// Instantiate the helper class using Gradle's object factory
+// Instantiate the helper class using Gradle's object factory.
 val gitExecutor = objects.newInstance(GitExecutor::class.java)
 
 val gitCommitCount = gitExecutor.execute("git rev-list HEAD --count", rootDir).toInt()

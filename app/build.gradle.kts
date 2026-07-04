@@ -12,7 +12,7 @@ plugins {
 
 ktfmt { kotlinLangStyle() }
 
-// Helper class to get access to the ExecOperations service
+// Helper class to get access to the ExecOperations service.
 abstract class GitExecutor @Inject constructor(private val execOperations: ExecOperations) {
     fun execute(command: String, currentWorkingDir: File): String {
         val byteOut = ByteArrayOutputStream()

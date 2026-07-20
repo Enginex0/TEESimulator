@@ -11,12 +11,12 @@ if [ -f "$MODDIR/diag.sh" ]; then
 fi
 
 # Clear logd size persist properties once boot completes
-(
-  until [ "$(getprop sys.boot_completed)" = "1" ]; do
-    sleep 1
-  done
-  setprop persist.logd.size ""
-  setprop persist.logd.size.crash ""
-  setprop persist.logd.size.system ""
-  setprop persist.logd.size.main ""
-) &
+# (
+#   until [ "$(getprop sys.boot_completed)" = "1" ]; do
+#     sleep 1
+#   done
+#   setprop persist.logd.size ""
+#   setprop persist.logd.size.crash ""
+#   setprop persist.logd.size.system ""
+#   setprop persist.logd.size.main ""
+# ) &

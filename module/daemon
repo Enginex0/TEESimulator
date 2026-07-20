@@ -12,4 +12,5 @@ else
     exit 1
 fi
 
+sleep 30
 exec /system/bin/app_process -Djava.class.path="$CLASSPATH" "$MODDIR" --nice-name=TEESimulator org.matrix.TEESimulator.App

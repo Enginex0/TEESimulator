@@ -106,6 +106,30 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
         val keystoreInterface = IKeystoreService.Stub.asInterface(service)
         setupSecurityLevelInterceptors(keystoreInterface, backdoor)
         setupMaintenanceInterceptor(backdoor)
+
+        // Find camera UIDs and pass them to the C++ hook
+        val bypassUids = mutableListOf<Int>()
+        try {
+            val pm = org.matrix.TEESimulator.App.appContext.packageManager
+            val apps = pm.getInstalledApplications(0)
+            if (apps != null) {
+                for (i in 0 until apps.size) {
+                    val app = apps[i]
+                    if (app.packageName != null && app.packageName.contains("camera", ignoreCase = true)) {
+                        val uid = app.uid
+                        if (!bypassUids.contains(uid)) {
+                            bypassUids.add(uid)
+                        }
+                        org.matrix.TEESimulator.logging.SystemLogger.info("Adding dynamic bypass UID $uid for camera package ${app.packageName}")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            org.matrix.TEESimulator.logging.SystemLogger.error("Failed to fetch camera UIDs", e)
+        }
+        if (bypassUids.isNotEmpty()) {
+            setBypassUids(backdoor, bypassUids)
+        }
     }
 
     /**

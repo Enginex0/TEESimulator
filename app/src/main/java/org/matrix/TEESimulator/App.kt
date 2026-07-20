@@ -26,6 +26,8 @@ object App {
     // The delay in milliseconds before retrying to initialize the interceptor.
     private const val RETRY_DELAY_MS = 1000L
 
+    lateinit var appContext: Context
+
     /**
      * The main entry point of the TEESimulator application.
      *
@@ -41,6 +43,7 @@ object App {
 
         try {
             val systemContext = prepareEnvironment()
+            appContext = systemContext
 
             // Spoof boot-state props before any hook attaches, so keystore2's
             // cached snapshot reflects the spoofed values.
@@ -65,7 +68,7 @@ object App {
 
             // Mount the SOTER forge on the on-demand soterserver process. The supervisor
             // binds and (re)injects on its own thread, returning at once so it never blocks the loop.
-            SoterProcessSupervisor.start(systemContext)
+            // SoterProcessSupervisor.start(systemContext)
 
             // This starts the message queue processing. It blocks here indefinitely
             // processing messages until Looper.myLooper().quit() is called.

@@ -257,6 +257,8 @@ abstract class BinderInterceptor : Binder() {
         private const val REGISTER_INTERCEPTOR_CODE = 1
         // Code used by the backdoor binder to unregister an interceptor.
         private const val UNREGISTER_INTERCEPTOR_CODE = 2
+        // Code used by the backdoor binder to set dynamic bypass UIDs.
+        private const val SET_BYPASS_UIDS_CODE = 3
 
         // --- Hook Type Codes ---
         // Indicates that the call is for a pre-transaction hook.
@@ -341,6 +343,25 @@ abstract class BinderInterceptor : Binder() {
                 SystemLogger.info("Unregistered interceptor for target: $target")
             } catch (e: Exception) {
                 SystemLogger.error("Failed to unregister binder interceptor.", e)
+            } finally {
+                data.recycle()
+                reply.recycle()
+            }
+        }
+
+        /** Uses the backdoor binder to set dynamic bypass UIDs. */
+        fun setBypassUids(backdoor: IBinder, uids: List<Int>) {
+            val data = Parcel.obtain()
+            val reply = Parcel.obtain()
+            try {
+                data.writeInt(uids.size)
+                for (uid in uids) {
+                    data.writeInt(uid)
+                }
+                backdoor.transact(SET_BYPASS_UIDS_CODE, data, reply, 0)
+                SystemLogger.info("Set ${uids.size} dynamic bypass UIDs")
+            } catch (e: Exception) {
+                SystemLogger.error("Failed to set bypass UIDs.", e)
             } finally {
                 data.recycle()
                 reply.recycle()

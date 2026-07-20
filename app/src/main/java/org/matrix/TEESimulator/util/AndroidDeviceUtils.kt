@@ -164,7 +164,11 @@ object AndroidDeviceUtils {
         val hex = bytes.toHex()
         try {
             SystemLogger.debug("Setting system property '$name' to: $hex")
-            val command = arrayOf("resetprop", name, hex)
+            val command = if (java.io.File("/data/adb/tricky_store/resetprop-rs").exists()) {
+                arrayOf("/data/adb/tricky_store/resetprop-rs", "--stealth", name, hex)
+            } else {
+                arrayOf("resetprop", name, hex)
+            }
             val process = Runtime.getRuntime().exec(command)
             val exitCode = process.waitFor()
 
@@ -190,7 +194,11 @@ object AndroidDeviceUtils {
     internal fun setProperty(name: String, value: String) {
         try {
             SystemLogger.debug("Setting system property '$name' to: $value")
-            val command = arrayOf("resetprop", name, value)
+            val command = if (java.io.File("/data/adb/tricky_store/resetprop-rs").exists()) {
+                arrayOf("/data/adb/tricky_store/resetprop-rs", "--stealth", name, value)
+            } else {
+                arrayOf("resetprop", name, value)
+            }
             val process = Runtime.getRuntime().exec(command)
             val exitCode = process.waitFor()
 

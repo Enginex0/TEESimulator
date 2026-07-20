@@ -128,6 +128,7 @@ namespace intercept {
 // Interceptor protocol codes (User space agreement between App and Interceptor Service)
 constexpr uint32_t kRegisterInterceptor = 1;
 constexpr uint32_t kUnregisterInterceptor = 2;
+constexpr uint32_t kSetBypassUids = 3;
 
 constexpr uint32_t kPreTransact = 1;
 constexpr uint32_t kPostTransact = 2;
@@ -208,6 +209,12 @@ int (*g_original_ioctl)(int fd, int request, ...) = nullptr;
 // Unique ID generator for transactions
 static std::atomic<uint64_t> g_transaction_id_counter = 0;
 
+// TEESimulator daemon PID
+static std::atomic<pid_t> g_daemon_pid = 0;
+static std::atomic<int32_t> g_dynamic_bypass_uids[32];
+static std::atomic<int32_t> g_dynamic_bypass_count = 0;
+
+
 // Context info to pass from the ioctl hook (processBinderWriteRead) to the BinderStub.
 struct ThreadTransactionInfo {
     uint64_t transaction_id;
@@ -263,6 +270,7 @@ protected:
 private:
     status_t handleRegister(const Parcel &data);
     status_t handleUnregister(const Parcel &data);
+    status_t handleSetBypassUids(const Parcel &data);
 
     // Helpers to serialize data for the remote callback interface
     status_t writeTransactionData(Parcel &out, uint64_t tx_id, sp<BBinder> target, uint32_t code, uint32_t flags,
@@ -368,15 +376,34 @@ void inspectAndRewriteTransaction(binder_transaction_data *txn_data) {
         info.transaction_code = intercept::kBackdoorCode;
         info.target_binder = nullptr;
         hijack = true;
-    // Check 2: Spoof uid of KeyStore requests from the daemon to bypass permission check
-    } else if (txn_data->sender_euid == 0) {
-        // The kernel driver fills sender_euid.
-        // libbinder.so trusts this value to populate IPCThreadState.
-        txn_data->sender_euid = 1000;
-        LOGV("[Hook] Spoofing UID for transaction: 0 -> %d", txn_data->sender_euid);
-        hijack = false; // Never hijack to avoid recursion
-    // Check 3: Normal interception based on registry of monitored binders
+        // Save the daemon's PID
+        g_daemon_pid = txn_data->sender_pid;
+    // Check 2: Bypass interception for specific system requests, but spoof UID for the daemon
     } else {
+        // Bypass system services (< 10000) to prevent crashes due to proxying changing the callingUid.
+        // EXCEPT UID 1027 (NFC), which must be intercepted for Google Pay to work.
+        bool bypass = (txn_data->sender_euid < 10000 && txn_data->sender_euid != 1027);
+        if (!bypass) {
+            int32_t count = g_dynamic_bypass_count.load(std::memory_order_acquire);
+            for (int32_t i = 0; i < count; i++) {
+                if (txn_data->sender_euid == static_cast<uid_t>(g_dynamic_bypass_uids[i].load(std::memory_order_relaxed))) {
+                    bypass = true;
+                    // Log bypass for debugging
+                    // LOGV("[Hook] Dynamic bypass triggered for UID %d", txn_data->sender_euid);
+                    break;
+                }
+            }
+        }
+        if (bypass) {
+            if (txn_data->sender_pid == g_daemon_pid) {
+                // The kernel driver fills sender_euid.
+                // libbinder.so trusts this value to populate IPCThreadState.
+                txn_data->sender_euid = 1000;
+                LOGV("[Hook] Spoofing UID for transaction: 0 -> %d", txn_data->sender_euid);
+            }
+            hijack = false; // Never hijack root, cameraserver, audioserver, or dynamic camera apps
+        // Check 3: Normal interception based on registry of monitored binders
+        } else {
         // Safe casting based on Binder driver ABI
         RefBase::weakref_type *weak_ref = reinterpret_cast<RefBase::weakref_type *>(txn_data->target.ptr);
 
@@ -397,6 +424,7 @@ void inspectAndRewriteTransaction(binder_transaction_data *txn_data) {
             // Manually release the temporary strong reference we acquired at the start.
             target_binder_ptr->decStrong(nullptr);
         }
+    }
     }
 
     if (hijack) {
@@ -512,6 +540,8 @@ status_t BinderInterceptor::onTransact(uint32_t code, const Parcel &data, Parcel
         return handleRegister(data);
     case intercept::kUnregisterInterceptor:
         return handleUnregister(data);
+    case intercept::kSetBypassUids:
+        return handleSetBypassUids(data);
     default:
         return BBinder::onTransact(code, data, reply, flags);
     }
@@ -566,6 +596,22 @@ status_t BinderInterceptor::handleUnregister(const Parcel &data) {
     }
     LOGW("Attempted to unregister a non-existent interceptor for binder %p", target.get());
     return NAME_NOT_FOUND;
+}
+
+status_t BinderInterceptor::handleSetBypassUids(const Parcel &data) {
+    int32_t count = 0;
+    if (data.readInt32(&count) != OK) return BAD_VALUE;
+    if (count < 0) return BAD_VALUE;
+    if (count > 32) count = 32;
+    for (int32_t i = 0; i < count; i++) {
+        int32_t uid = 0;
+        if (data.readInt32(&uid) == OK) {
+            g_dynamic_bypass_uids[i].store(uid, std::memory_order_relaxed);
+        }
+    }
+    g_dynamic_bypass_count.store(count, std::memory_order_release);
+    LOGI("Set %d dynamic bypass UIDs", count);
+    return OK;
 }
 
 status_t BinderInterceptor::writeTransactionData(Parcel &out, uint64_t tx_id, sp<BBinder> target, uint32_t code,

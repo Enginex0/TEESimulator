@@ -71,6 +71,16 @@ install_file "lib/$ABI_DIR/libsupervisor.so" "$MODPATH"
 install_file "lib/$ABI_DIR/libcertgen.so" "$MODPATH"
 ui_print ""
 
+ui_print "- Extracting resetprop-rs for stealth property spoofing"
+if unzip -l "$ZIPFILE" | grep -q "bin/resetprop-$ABI_DIR"; then
+  install_file "bin/resetprop-$ABI_DIR" "$CONFIG_DIR"
+  mv "$CONFIG_DIR/resetprop-$ABI_DIR" "$CONFIG_DIR/resetprop-rs"
+  chmod 755 "$CONFIG_DIR/resetprop-rs"
+else
+  ui_print "  ! resetprop-rs not found for $ARCH"
+fi
+ui_print ""
+
 mv "$MODPATH/libinject.so" "$MODPATH/inject"
 mv "$MODPATH/libsupervisor.so" "$MODPATH/supervisor"
 chmod 755 "$MODPATH/inject"

@@ -2,12 +2,14 @@
 agp = "8.13.2"
 annotation = "1.9.1"
 jdk18on = "1.83"
+junit = "4.13.2"
 kotlin = "2.3.0"
 ktfmt = "0.25.0"
 
 [libraries]
 annotation = { module = "androidx.annotation:annotation", version.ref = "annotation" }
 bcpkix = { module = "org.bouncycastle:bcpkix-jdk18on", version.ref = "jdk18on" }
+junit = { module = "junit:junit", version.ref = "junit" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

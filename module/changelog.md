@@ -3,6 +3,30 @@
 
 ---
 
+## TEESimulator-RS v6.0.1-309
+
+Fixes Xiaomi/Redmi/Poco bootloader-state disclosure through vendor system-property aliases.
+
+### Boot-state spoofing
+- Xiaomi/Redmi/Poco vendor aliases are now normalized alongside the standard AVB properties. In particular, `ro.secureboot.lockstate` no longer remains `unlocked` while `ro.boot.flash.locked` and `ro.boot.vbmeta.device_state` report a locked device.
+- Windows builds now normalize module installer and shell scripts to LF so KernelSU/Magisk can execute them.
+
+### Verified
+- On a Redmi Android 14 device, the standard AVB and Xiaomi secure-boot properties all report a consistent locked/green state after applying the new overrides.
+
+### 中文说明
+
+修复 Xiaomi/Redmi/Poco 通过厂商系统属性别名泄露 bootloader 解锁状态的问题。
+
+**启动状态伪装**
+- Xiaomi/Redmi/Poco 的厂商属性别名现在会与标准 AVB 属性一起归一化，避免 `ro.boot.flash.locked` 和 `ro.boot.vbmeta.device_state` 已显示锁定时，`ro.secureboot.lockstate` 仍泄露 `unlocked`。
+- Windows 环境打包时会将模块安装器和 Shell 脚本统一为 LF 换行，确保 KernelSU/Magisk 可以正常执行。
+
+**验证**
+- 已在 Redmi Android 14 设备上验证：应用新增覆盖后，标准 AVB 与 Xiaomi secure-boot 属性均一致报告 locked/green。
+
+---
+
 ## TEESimulator-RS v6.0.1-307
 
 Fixes five gaps in the module's TEE key-operation and attestation emulation. Two of them fix crashes in real app crypto on a broken-TEE device: any app using an AndroidKeyStore HMAC key or an RSA-OAEP-SHA256 key was throwing. This is a beta; the confirmation logs are in the debug build only, and nothing is field-verified yet.

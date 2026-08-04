@@ -15,12 +15,16 @@ object BootStateManager {
         DISABLE,
     }
 
-    private val targets =
+    internal val targetOverrides: Map<String, String> =
         linkedMapOf(
             "ro.boot.verifiedbootstate" to "green",
             "ro.boot.flash.locked" to "1",
             "ro.boot.veritymode" to "enforcing",
             "ro.boot.vbmeta.device_state" to "locked",
+            // Xiaomi/MediaTek also publish the bootloader state outside the ro.boot namespace.
+            "ro.boot.secureboot" to "1",
+            "ro.secureboot.devicelock" to "1",
+            "ro.secureboot.lockstate" to "locked",
         )
 
     private val fillIfAbsent =
@@ -51,7 +55,7 @@ object BootStateManager {
             }
         }
 
-        for ((name, target) in targets) {
+        for ((name, target) in targetOverrides) {
             val current = SystemProperties.get(name, "")
             if (current.isEmpty()) {
                 SystemLogger.debug("BootStateManager: $name absent on this device, skip")

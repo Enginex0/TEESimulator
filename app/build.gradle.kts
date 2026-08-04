@@ -79,6 +79,7 @@ dependencies {
     compileOnly(project(":stub"))
     compileOnly(libs.annotation)
     implementation(libs.bcpkix)
+    testImplementation(libs.junit)
 }
 
 // --- Rust native cert gen build task ---
@@ -239,6 +240,31 @@ androidComponents {
                                 "\nallow keystore media_rw_data_file { dir file } *" +
                                     "\nallow platform_app media_rw_data_file { dir file } *\n",
                             )
+                    }
+                }
+
+                doLast {
+                    // Android module installers and shells reject CRLF scripts from Windows checkouts.
+                    val unixTextFiles =
+                        listOf(
+                            "customize.sh",
+                            "service.sh",
+                            "action.sh",
+                            "action_i18n.sh",
+                            "uninstall.sh",
+                            "diag.sh",
+                            "daemon",
+                            "META-INF/com/google/android/update-binary",
+                            "META-INF/com/google/android/updater-script",
+                        )
+
+                    unixTextFiles.forEach { relativePath ->
+                        val file = tempModuleDir.get().asFile.resolve(relativePath)
+                        if (file.isFile) {
+                            val normalized =
+                                file.readText().replace("\r\n", "\n").replace("\r", "\n")
+                            file.writeText(normalized)
+                        }
                     }
                 }
             }

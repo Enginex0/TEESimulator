@@ -120,6 +120,8 @@ Controls global `ro.boot.*` property spoofing. Values: `auto` (default), `force`
 
 In `auto`, Oplus-family devices (OnePlus/OPPO/realme/Oplus) skip boot-state prop spoofing to avoid conflicts with vendor TEE services such as ultrasonic fingerprint calibration. Create `/data/adb/tricky_store/boot_props_mode` with `force` to restore the old behavior, or `disable` to turn it off on any device.
 
+On Xiaomi/Redmi/Poco devices, the module also normalizes the vendor `ro.secureboot.*` aliases when they exist. This prevents `ro.secureboot.lockstate` from continuing to report `unlocked` after the standard AVB properties have been spoofed.
+
 ## Building from source
 
 You need JDK 21, the Android SDK and NDK 29, Rust (stable) with the `aarch64-linux-android` target, and `cargo-ndk`.

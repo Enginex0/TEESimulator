@@ -16,6 +16,7 @@ import android.system.keystore2.KeyParameters
 import java.security.KeyPair
 import java.security.Signature
 import java.security.SignatureException
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.LockSupport
 import javax.crypto.Cipher
 import org.matrix.TEESimulator.attestation.KeyMintAttestation
@@ -334,11 +335,14 @@ class SoftwareOperation(
     private val latencyFloorMs: Long = 0L,
 ) {
     private val primitive: CryptoPrimitive
+    private val finalizeCallbackInvoked = AtomicBoolean(false)
+
     @Volatile
     var finalized = false
         private set
 
     var onFinishCallback: (() -> Unit)? = null
+    var onFinalizeCallback: (() -> Unit)? = null
 
     val beginParameters: KeyParameters?
         get() {
@@ -510,7 +514,7 @@ class SoftwareOperation(
                 val delayMs = latencyFloorMs - elapsedMs
                 if (delayMs > 0) LockSupport.parkNanos(delayMs * 1_000_000)
             }
-            finalized = true
+            finalizeOperation()
             onFinishCallback?.invoke()
             SystemLogger.info("[SoftwareOp TX_ID: $txId] Finished operation successfully.")
             return result
@@ -523,9 +527,16 @@ class SoftwareOperation(
     }
 
     fun abort() {
-        finalized = true
+        finalizeOperation()
         primitive.abort()
         SystemLogger.debug("[SoftwareOp TX_ID: $txId] Operation aborted.")
+    }
+
+    private fun finalizeOperation() {
+        finalized = true
+        if (finalizeCallbackInvoked.compareAndSet(false, true)) {
+            onFinalizeCallback?.invoke()
+        }
     }
 
     private fun mapToServiceSpecificException(e: Exception): ServiceSpecificException =

@@ -14,6 +14,7 @@ class OperationInterceptor(
     private val original: IKeystoreOperation,
     private val backdoor: IBinder,
     private val isAead: Boolean,
+    private val onFinalize: (() -> Unit)? = null,
 ) : BinderInterceptor() {
 
     override fun onPreTransact(
@@ -40,7 +41,11 @@ class OperationInterceptor(
         }
 
         if (code == FINISH_TRANSACTION || code == ABORT_TRANSACTION) {
-            KeyMintSecurityLevelInterceptor.removeOperationInterceptor(target, backdoor)
+            try {
+                KeyMintSecurityLevelInterceptor.removeOperationInterceptor(target, backdoor)
+            } finally {
+                onFinalize?.invoke()
+            }
         }
 
         return TransactionResult.ContinueAndSkipPost

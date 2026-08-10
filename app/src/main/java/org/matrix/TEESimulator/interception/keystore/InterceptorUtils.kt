@@ -165,6 +165,27 @@ object InterceptorUtils {
         return exception != null
     }
 
+    /**
+     * Reads the exception a reply parcel carries, if any, without disturbing the caller: the
+     * original data position is always restored. Returns the Throwable that `readException()`
+     * raised (a ServiceSpecificException for EX_SERVICE_SPECIFIC, so callers can inspect its
+     * errorCode) or null when the reply encodes success. Unlike [hasException] this exposes the
+     * exception itself, which callers need to distinguish, e.g., OPERATION_BUSY from a terminal
+     * error.
+     */
+    fun readExceptionOrNull(reply: Parcel): Throwable? {
+        val savedPos = reply.dataPosition()
+        val exception =
+            try {
+                reply.readException()
+                null
+            } catch (t: Throwable) {
+                t
+            }
+        reply.setDataPosition(savedPos)
+        return exception
+    }
+
     fun createServiceSpecificErrorReply(
         errorCode: Int
     ): BinderInterceptor.TransactionResult.OverrideReply = createErrorReply(errorCode)

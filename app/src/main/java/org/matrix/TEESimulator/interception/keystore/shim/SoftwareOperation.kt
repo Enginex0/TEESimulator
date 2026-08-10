@@ -16,6 +16,7 @@ import android.system.keystore2.KeyParameters
 import java.security.KeyPair
 import java.security.Signature
 import java.security.SignatureException
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.LockSupport
 import javax.crypto.Cipher
 import org.matrix.TEESimulator.attestation.KeyMintAttestation
@@ -334,11 +335,14 @@ class SoftwareOperation(
     private val latencyFloorMs: Long = 0L,
 ) {
     private val primitive: CryptoPrimitive
+    private val finalizeCallbackInvoked = AtomicBoolean(false)
+
     @Volatile
     var finalized = false
         private set
 
     var onFinishCallback: (() -> Unit)? = null
+    var onFinalizeCallback: (() -> Unit)? = null
 
     val beginParameters: KeyParameters?
         get() {
@@ -469,8 +473,8 @@ class SoftwareOperation(
             "[SoftwareOp TX_ID: $txId] updateAad() ENTRY inputSize=${aadInput?.size ?: 0} primitive=${primitive::class.simpleName}"
         )
         checkActive()
-        checkInputLength(aadInput)
         try {
+            checkInputLength(aadInput)
             primitive.updateAad(aadInput)
             SystemLogger.info(
                 "[SoftwareOp TX_ID: $txId] updateAad() RETURNED_NORMALLY (unexpected for non-AEAD)"
@@ -481,6 +485,8 @@ class SoftwareOperation(
             SystemLogger.info(
                 "[SoftwareOp TX_ID: $txId] updateAad() THREW class=${throwable::class.java.name} code=$code msg=${throwable.message} top=$top"
             )
+            // A failed updateAad ends the operation in AOSP Keystore2; finalize to release the slot.
+            finalizeOperation()
             throw throwable
         }
     }
@@ -488,21 +494,26 @@ class SoftwareOperation(
     fun update(data: ByteArray?): ByteArray? {
         SystemLogger.debug("[SoftwareOp TX_ID: $txId] update() inputSize=${data?.size ?: 0}")
         checkActive()
-        checkInputLength(data)
         try {
+            checkInputLength(data)
             return primitive.update(data)
         } catch (e: ServiceSpecificException) {
+            // AOSP Keystore2 with_locked_operation() removes the operation when the KM call
+            // returns an error, so a failed update ends the operation on the real device too.
+            // Finalize here to release any reserved slot instead of leaking it until reboot.
+            finalizeOperation()
             throw e
         } catch (e: Exception) {
             SystemLogger.error("[SoftwareOp TX_ID: $txId] Failed to update operation.", e)
+            finalizeOperation()
             throw mapToServiceSpecificException(e)
         }
     }
 
     fun finish(data: ByteArray?, signature: ByteArray?): ByteArray? {
         checkActive()
-        checkInputLength(data)
         try {
+            checkInputLength(data)
             val startNs = if (latencyFloorMs > 0) System.nanoTime() else 0L
             val result = primitive.finish(data, signature)
             if (latencyFloorMs > 0) {
@@ -510,22 +521,34 @@ class SoftwareOperation(
                 val delayMs = latencyFloorMs - elapsedMs
                 if (delayMs > 0) LockSupport.parkNanos(delayMs * 1_000_000)
             }
-            finalized = true
+            finalizeOperation()
             onFinishCallback?.invoke()
             SystemLogger.info("[SoftwareOp TX_ID: $txId] Finished operation successfully.")
             return result
         } catch (e: ServiceSpecificException) {
+            // A finish() that reports an error still terminates the operation in AOSP Keystore2,
+            // so finalize on the error path too; onFinishCallback is intentionally not fired since
+            // the operation did not complete successfully.
+            finalizeOperation()
             throw e
         } catch (e: Exception) {
             SystemLogger.error("[SoftwareOp TX_ID: $txId] Failed to finish operation.", e)
+            finalizeOperation()
             throw mapToServiceSpecificException(e)
         }
     }
 
     fun abort() {
-        finalized = true
+        finalizeOperation()
         primitive.abort()
         SystemLogger.debug("[SoftwareOp TX_ID: $txId] Operation aborted.")
+    }
+
+    private fun finalizeOperation() {
+        finalized = true
+        if (finalizeCallbackInvoked.compareAndSet(false, true)) {
+            onFinalizeCallback?.invoke()
+        }
     }
 
     private fun mapToServiceSpecificException(e: Exception): ServiceSpecificException =

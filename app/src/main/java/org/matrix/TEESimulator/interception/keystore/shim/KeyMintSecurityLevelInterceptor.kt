@@ -322,17 +322,13 @@ class KeyMintSecurityLevelInterceptor(
 
     private fun trackAndEnforceOpLimit(callingUid: Int, txId: Long): TransactionResult? {
         if (securityLevel != SecurityLevel.STRONGBOX) return null
-        val timestamps = recentOps.computeIfAbsent(callingUid) { ConcurrentLinkedDeque() }
-        val cutoff = System.nanoTime() - STRONGBOX_OP_WINDOW_NS
-        timestamps.removeIf { it < cutoff }
-        val swOps = activeOps[callingUid]?.count { !it.finalized } ?: 0
-        if (timestamps.size + swOps >= STRONGBOX_MAX_CONCURRENT_OPS) {
+        val inFlight = activeOps[callingUid]?.count { !it.finalized } ?: 0
+		if (inFlight >= STRONGBOX_MAX_CONCURRENT_OPS) {
             SystemLogger.info(
-                "[TX_ID: $txId] StrongBox op limit reached for uid=$callingUid (hw=${timestamps.size} sw=$swOps max=$STRONGBOX_MAX_CONCURRENT_OPS)"
+                "[TX_ID: $txId] StrongBox in-flight op limit reached for uid=$callingUid (active=$inFlight max=$STRONGBOX_MAX_CONCURRENT_OPS)"
             )
             return InterceptorUtils.createErrorReply(KEYMINT_TOO_MANY_OPERATIONS)
         }
-        timestamps.addLast(System.nanoTime())
         return null
     }
 

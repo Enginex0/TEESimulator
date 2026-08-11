@@ -24,7 +24,7 @@ import java.util.Date
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.LockSupport
 import org.matrix.TEESimulator.attestation.AttestationBuilder
 import org.matrix.TEESimulator.attestation.AttestationConstants
@@ -61,7 +61,68 @@ class KeyMintSecurityLevelInterceptor(
     )
 
     private val activeOps = ConcurrentHashMap<Int, ConcurrentLinkedDeque<SoftwareOperation>>()
-    private val recentOps = ConcurrentHashMap<Int, ConcurrentLinkedDeque<Long>>()
+    private val strongBoxOps = ConcurrentHashMap<Int, StrongBoxUidState>()
+
+    /**
+     * Reserved slots for one uid. Every mutation happens inside a [ConcurrentHashMap.compute] block
+     * on [strongBoxOps], so the list needs no lock of its own and the reserve/reclaim decision stays
+     * atomic against concurrent createOperation calls.
+     */
+    private class StrongBoxUidState {
+        val slots = ArrayList<StrongBoxOpSlot>()
+    }
+
+    /**
+     * A single reserved StrongBox operation slot for [uid]. At most one release fires per slot,
+     * guarded by [released].
+     *
+     * Only software-simulated StrongBox operations reserve a slot. Operations forwarded to the real
+     * StrongBox HAL are not gated here: the hardware enforces its own concurrent-operation limit and
+     * answers TOO_MANY_OPERATIONS itself, so a module-side counter for them is redundant. It was also
+     * the cause of #49 — a forwarded finish that completed on hardware never decremented the counter,
+     * which climbed to four and then rejected every StrongBox operation on the device, including apps
+     * not listed in target.txt, because the gate lives at the keystore2 hook level.
+     *
+     * A slot is released only once its operation has finalized. The primary path is
+     * [SoftwareOperation.onFinalizeCallback], which fires on finish, abort, and any fatal
+     * update/finish/updateAad error; [reserveStrongBoxOp] also sweeps finalized slots as a
+     * belt-and-suspenders. There is deliberately no time-based reclaim: dropping the accounting for
+     * a still-live operation would let its SoftwareOperation linger in [activeOps] (whose StrongBox
+     * cap is disabled) while a replacement is admitted, so abandoned operations could accumulate
+     * without bound. Keeping the slot until finalize instead caps live-but-unfinished operations at
+     * [STRONGBOX_MAX_CONCURRENT_OPS] per uid. The trade-off is that an operation abandoned with no
+     * terminal transaction (process death, a dropped binder) holds its slot until keystore2
+     * restarts; four such abandonments wedge that uid's software StrongBox path, which is bounded
+     * and far less severe than an unbounded keystore2 memory leak.
+     */
+    private inner class StrongBoxOpSlot(private val uid: Int) {
+        private val released = AtomicBoolean(false)
+
+        /** The simulated operation holding this slot. */
+        @Volatile var operation: SoftwareOperation? = null
+
+        /** Claims the sole right to account for this slot's release. Idempotent via the CAS. */
+        fun markReleased(): Boolean = released.compareAndSet(false, true)
+
+        /**
+         * Drops this slot's accounting entry. The claim and the list removal happen inside one
+         * [ConcurrentHashMap.computeIfPresent] so they are atomic against a concurrent
+         * [reserveStrongBoxOp] on the same uid: either this removal is observed whole, or the reserve
+         * sweep claims and removes the slot itself. Splitting the two (claim, then remove) would let
+         * a reserve see a finalized-but-not-yet-removed slot it can no longer claim, leaving it in
+         * the list and spuriously rejecting the next request as TOO_MANY_OPERATIONS. [release] is
+         * never called from inside a compute block, so re-entering the map here is safe.
+         */
+        fun release() {
+            strongBoxOps.computeIfPresent(uid) { _, state ->
+                if (markReleased()) state.slots.remove(this)
+                if (state.slots.isEmpty()) null else state
+            }
+        }
+
+        /** Reclaimable only once its operation has finalized; an unfinished operation is kept. */
+        fun isReclaimable(): Boolean = operation?.finalized == true
+    }
 
     override fun onPreTransact(
         txId: Long,
@@ -81,7 +142,7 @@ class KeyMintSecurityLevelInterceptor(
             CREATE_OPERATION_TRANSACTION -> {
                 logTransaction(txId, transactionNames[code]!!, callingUid, callingPid)
 
-                return handleCreateOperation(txId, callingUid, data)
+                return handleCreateOperation(txId, callingUid, callingPid, data)
             }
             IMPORT_KEY_TRANSACTION -> {
                 logTransaction(txId, transactionNames[code]!!, callingUid, callingPid)
@@ -119,8 +180,9 @@ class KeyMintSecurityLevelInterceptor(
         reply: Parcel?,
         resultCode: Int,
     ): TransactionResult {
-        if (resultCode != 0 || reply == null || InterceptorUtils.hasException(reply))
+        if (resultCode != 0 || reply == null || InterceptorUtils.hasException(reply)) {
             return TransactionResult.SkipTransaction
+        }
 
         if (code == IMPORT_KEY_TRANSACTION) {
             logTransaction(txId, "post-${transactionNames[code]!!}", callingUid, callingPid)
@@ -198,22 +260,26 @@ class KeyMintSecurityLevelInterceptor(
                 "[TX_ID: $txId] CreateOperationResponse: ${response.iOperation} ${response.operationChallenge}"
             )
 
-            // Intercept the IKeystoreOperation binder
+            // Wrap the forwarded IKeystoreOperation so the non-AEAD updateAad vendor gate applies.
+            // Forwarded StrongBox operations are limited by the real HAL, so no slot is tracked here.
             response.iOperation?.let { operation ->
                 val operationBinder = operation.asBinder()
                 if (!interceptedOperations.containsKey(operationBinder)) {
-                    SystemLogger.info("Found new IKeystoreOperation. Registering interceptor...")
+                    SystemLogger.trace { "Found new IKeystoreOperation. Registering interceptor..." }
                     val backdoor = getBackdoor(target)
                     if (backdoor != null) {
                         val isAead = parsedParams.blockMode.firstOrNull() == BlockMode.GCM
                         val interceptor = OperationInterceptor(operation, backdoor, isAead)
-                        register(
-                            backdoor,
-                            operationBinder,
-                            interceptor,
-                            OperationInterceptor.INTERCEPTED_CODES,
-                        )
-                        interceptedOperations[operationBinder] = interceptor
+                        if (
+                            register(
+                                backdoor,
+                                operationBinder,
+                                interceptor,
+                                OperationInterceptor.INTERCEPTED_CODES,
+                            )
+                        ) {
+                            interceptedOperations[operationBinder] = interceptor
+                        }
                     } else {
                         SystemLogger.error(
                             "Failed to get backdoor to register OperationInterceptor."
@@ -320,28 +386,91 @@ class KeyMintSecurityLevelInterceptor(
         )
     }
 
-    private fun trackAndEnforceOpLimit(callingUid: Int, txId: Long): TransactionResult? {
-        if (securityLevel != SecurityLevel.STRONGBOX) return null
-        val timestamps = recentOps.computeIfAbsent(callingUid) { ConcurrentLinkedDeque() }
-        val cutoff = System.nanoTime() - STRONGBOX_OP_WINDOW_NS
-        timestamps.removeIf { it < cutoff }
-        val swOps = activeOps[callingUid]?.count { !it.finalized } ?: 0
-        if (timestamps.size + swOps >= STRONGBOX_MAX_CONCURRENT_OPS) {
-            SystemLogger.info(
-                "[TX_ID: $txId] StrongBox op limit reached for uid=$callingUid (hw=${timestamps.size} sw=$swOps max=$STRONGBOX_MAX_CONCURRENT_OPS)"
-            )
-            return InterceptorUtils.createErrorReply(KEYMINT_TOO_MANY_OPERATIONS)
+    /**
+     * Reserves one of the [STRONGBOX_MAX_CONCURRENT_OPS] in-flight slots for [callingUid], or
+     * returns null so the caller rejects with TOO_MANY_OPERATIONS. Only the software-simulated path
+     * calls this; forwarded operations are limited by the real HAL and are not counted here.
+     *
+     * Before deciding a uid is full, the sweep reclaims slots whose SoftwareOperation has already
+     * finalized. This is a belt-and-suspenders complement to [SoftwareOperation.onFinalizeCallback]
+     * (the normal, immediate release path) and closes the small window where a finish and a new
+     * create interleave. Reclaiming drops the accounting entry only; it never aborts an operation, so
+     * it can never drop a live one. Slots for unfinished operations are kept, which caps live-but-
+     * unfinished operations at [STRONGBOX_MAX_CONCURRENT_OPS] per uid and keeps [activeOps] bounded;
+     * the cost is that an operation abandoned with no terminal transaction holds its slot until
+     * keystore2 restarts.
+     */
+    private fun reserveStrongBoxOp(callingUid: Int, txId: Long): StrongBoxOpSlot? {
+        var slot: StrongBoxOpSlot? = null
+        var reclaimedCount = 0
+        var inFlight = 0
+
+        strongBoxOps.compute(callingUid) { _, current ->
+            val state = current ?: StrongBoxUidState()
+
+            val iterator = state.slots.iterator()
+            while (iterator.hasNext()) {
+                val existing = iterator.next()
+                if (existing.isReclaimable() && existing.markReleased()) {
+                    iterator.remove()
+                    reclaimedCount++
+                }
+            }
+
+            if (state.slots.size < STRONGBOX_MAX_CONCURRENT_OPS) {
+                slot = StrongBoxOpSlot(callingUid).also { state.slots.add(it) }
+            }
+            inFlight = state.slots.size
+            if (state.slots.isEmpty()) null else state
         }
-        timestamps.addLast(System.nanoTime())
-        return null
+
+        if (reclaimedCount > 0) {
+            SystemLogger.info(
+                "[TX_ID: $txId] Reclaimed StrongBox slots for uid=$callingUid (reclaimed=$reclaimedCount active=$inFlight)"
+            )
+        }
+        if (slot == null) {
+            SystemLogger.info(
+                "[TX_ID: $txId] StrongBox in-flight op limit reached for uid=$callingUid (active=$inFlight max=$STRONGBOX_MAX_CONCURRENT_OPS)"
+            )
+        }
+        return slot
+    }
+
+    /**
+     * Forwards the createOperation to the real HAL, returning [TransactionResult.Continue] so the
+     * CREATE_OPERATION post hook runs and wraps the returned IKeystoreOperation with an
+     * [OperationInterceptor]. That wrapping is required for every security level (it drives the
+     * non-AEAD updateAad vendor gate), so no level may skip the post hook.
+     *
+     * Forwarded StrongBox operations are intentionally not gated here. They run on the real StrongBox
+     * HAL, which enforces its own concurrent-operation limit and answers TOO_MANY_OPERATIONS itself,
+     * so a module-side counter for them was redundant — and it was the cause of #49: a forwarded
+     * finish that completed on hardware never decremented the counter, which climbed to four and then
+     * rejected every StrongBox operation on the device, including apps not in target.txt. Only
+     * software-simulated StrongBox operations, which have no hardware enforcer, are gated (in
+     * [handleCreateOperation]).
+     */
+    private fun forwardCreateOperation(
+        txId: Long,
+        callingUid: Int,
+        callingPid: Int,
+    ): TransactionResult {
+        SystemLogger.trace {
+            "[TX_ID: $txId] Forwarding createOperation to HAL for uid=$callingUid pid=$callingPid (no module gate)"
+        }
+        return TransactionResult.Continue
     }
 
     private fun handleCreateOperation(
         txId: Long,
         callingUid: Int,
+        callingPid: Int,
         data: Parcel,
-    ): TransactionResult =
-        runCatching {
+    ): TransactionResult {
+        var strongBoxSlot: StrongBoxOpSlot? = null
+        try {
+            return runCatching {
                 SystemLogger.debug(
                     "[TX_ID: $txId] createOperation parcel: dataSize=${data.dataSize()} dataAvail=${data.dataAvail()} dataPos=${data.dataPosition()}"
                 )
@@ -364,7 +493,7 @@ class KeyMintSecurityLevelInterceptor(
                                         SystemLogger.info(
                                             "[TX_ID: $txId] createOperation domain=APP with null alias, forwarding to HAL"
                                         )
-                                        return TransactionResult.ContinueAndSkipPost
+                                        return forwardCreateOperation(txId, callingUid, callingPid)
                                     }
                             val key = KeyIdentifier(callingUid, alias)
                             generatedKeys[key]?.let { java.util.AbstractMap.SimpleEntry(key, it) }
@@ -372,7 +501,7 @@ class KeyMintSecurityLevelInterceptor(
                                     SystemLogger.info(
                                         "[TX_ID: $txId] createOperation alias=$alias not in generatedKeys, forwarding to HAL"
                                     )
-                                    return TransactionResult.ContinueAndSkipPost
+                                    return forwardCreateOperation(txId, callingUid, callingPid)
                                 }
                         }
                         Domain.KEY_ID -> {
@@ -385,28 +514,21 @@ class KeyMintSecurityLevelInterceptor(
                                         .find { it.value.nspace == nspace }
                             entry
                                 ?: run {
-                                    trackAndEnforceOpLimit(callingUid, txId)?.let {
-                                        return it
-                                    }
                                     SystemLogger.info(
                                         "[TX_ID: $txId] createOperation KeyId(${keyDescriptor.nspace}) NOT FOUND for uid=$callingUid. Forwarding to HAL."
                                     )
-                                    return TransactionResult.ContinueAndSkipPost
+                                    return forwardCreateOperation(txId, callingUid, callingPid)
                                 }
                         }
                         else -> {
                             SystemLogger.info(
                                 "[TX_ID: $txId] createOperation domain=${keyDescriptor.domain}, forwarding to HAL"
                             )
-                            return TransactionResult.ContinueAndSkipPost
+                            return forwardCreateOperation(txId, callingUid, callingPid)
                         }
                     }
                 val generatedKeyInfo = resolvedEntry.value
                 val resolvedKeyId = resolvedEntry.key
-
-                trackAndEnforceOpLimit(callingUid, txId)?.let {
-                    return it
-                }
 
                 SystemLogger.info("[TX_ID: $txId] Creating SOFTWARE operation for uid=$callingUid.")
 
@@ -507,10 +629,33 @@ class KeyMintSecurityLevelInterceptor(
                     }
                 }
 
+                // Reserve the StrongBox slot only now: the request is valid, resolves to the
+                // software path, passed authorize_create, the SoftwareOperation was constructed
+                // successfully, and the usage-count check (which can still reject with
+                // KEY_NOT_FOUND) has passed. Reserving earlier could count a request that a later
+                // check would reject. When four operations are already in flight the request is
+                // rejected with TOO_MANY_OPERATIONS; a live operation is never aborted to make room,
+                // matching the concurrent-limit contract this PR defines.
+                if (securityLevel == SecurityLevel.STRONGBOX) {
+                    val reserved =
+                        reserveStrongBoxOp(callingUid, txId)
+                            ?: return InterceptorUtils.createErrorReply(KEYMINT_TOO_MANY_OPERATIONS)
+                    // Tag the slot with its software operation so the reserve gate can drop the
+                    // accounting entry once it finalizes. The operation is never aborted to make
+                    // room; a fifth request is rejected instead.
+                    reserved.operation = softwareOperation
+                    softwareOperation.onFinalizeCallback = reserved::release
+                    strongBoxSlot = reserved
+                }
+
+                // For StrongBox the reservation gate above is the sole enforcer of the concurrent
+                // limit; a request that reaches here already holds a slot, so pruneOpsForUid must
+                // only track the operation and drop finalized entries, never abort a live op to
+                // make room. Passing Int.MAX_VALUE disables its LRU eviction for StrongBox while
+                // keeping the deque bookkeeping. Non-StrongBox levels keep their existing LRU cap.
                 val maxOps =
-                    if (securityLevel == SecurityLevel.STRONGBOX) STRONGBOX_MAX_CONCURRENT_OPS
+                    if (securityLevel == SecurityLevel.STRONGBOX) Int.MAX_VALUE
                     else MAX_CONCURRENT_OPS_PER_UID
-                pruneOpsForUid(callingUid, softwareOperation, maxOps)
                 val operationBinder = SoftwareOperationBinder(softwareOperation)
 
                 val response =
@@ -520,12 +665,25 @@ class KeyMintSecurityLevelInterceptor(
                         parameters = softwareOperation.beginParameters
                     }
 
-                InterceptorUtils.createTypedObjectReply(response)
+                // Track the operation and clear strongBoxSlot only after the reply is built.
+                // beginParameters and createTypedObjectReply can throw; if they do, runCatching
+                // below turns it into an error reply, the operation never reaches the client, and
+                // the finally releases the reservation. Adding to activeOps only now means such a
+                // failed request leaves no un-finalized operation lingering in the deque (which,
+                // with the StrongBox cap disabled, would never be evicted).
+                val reply = InterceptorUtils.createTypedObjectReply(response)
+                pruneOpsForUid(callingUid, softwareOperation, maxOps)
+                strongBoxSlot = null
+                reply
             }
             .getOrElse {
                 SystemLogger.error("Error during createOperation for UID $callingUid.", it)
                 InterceptorUtils.createServiceSpecificErrorReply(KEYMINT_UNKNOWN_ERROR)
             }
+        } finally {
+            strongBoxSlot?.release()
+        }
+    }
 
     private fun handleGenerateKey(
         txId: Long,
@@ -1511,7 +1669,6 @@ class KeyMintSecurityLevelInterceptor(
         private const val SECURE_HW_COMMUNICATION_FAILED = -49
         private const val MAX_CONCURRENT_OPS_PER_UID = 15
         private const val STRONGBOX_MAX_CONCURRENT_OPS = 4
-        private const val STRONGBOX_OP_WINDOW_NS = 10_000_000_000L // 10s
 
         private fun isStrongBoxCapable(params: KeyMintAttestation): Boolean =
             when (params.algorithm) {

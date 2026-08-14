@@ -64,6 +64,8 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
 
     private const val RESPONSE_KEY_NOT_FOUND = 7
     private const val RESPONSE_PERMISSION_DENIED = 6
+    private const val KEY_PERMISSION_GET_INFO = 0x4
+    private const val KEY_PERMISSION_UPDATE = 0x80
 
     // KeyStoreManager.grantKeyAccess() became a public app API in Android 16 (API 36). Before that,
     // grant was a hidden API and SELinux denied untrusted_app, so a synthetic-key grant must answer
@@ -244,7 +246,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                         InterceptorUtils.createErrorReply(RESPONSE_KEY_NOT_FOUND)
                     else TransactionResult.ContinueAndSkipPost
                 }
-                if ((grant.accessVector and 0x4) == 0) { // GET_INFO = 0x4 (access-vector gate)
+                if ((grant.accessVector and KEY_PERMISSION_GET_INFO) == 0) {
                     return InterceptorUtils.createErrorReply(RESPONSE_PERMISSION_DENIED)
                 }
                 val response =
@@ -723,6 +725,42 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             data.readTypedObject(KeyDescriptor.CREATOR)
                 ?: return TransactionResult.ContinueAndSkipPost
 
+        if (descriptor.domain == Domain.GRANT) {
+            val grant =
+                KeyMintSecurityLevelInterceptor.resolveGrant(descriptor.nspace, callingUid)
+            if (grant == null) {
+                return if (
+                    KeyMintSecurityLevelInterceptor.softwareGrants.containsKey(descriptor.nspace)
+                )
+                    InterceptorUtils.createErrorReply(RESPONSE_KEY_NOT_FOUND)
+                else TransactionResult.ContinueAndSkipPost
+            }
+            if ((grant.accessVector and KEY_PERMISSION_UPDATE) == 0) {
+                return InterceptorUtils.createErrorReply(RESPONSE_PERMISSION_DENIED)
+            }
+
+            val generatedKeyInfo =
+                KeyMintSecurityLevelInterceptor.generatedKeys[grant.ownerKeyId]
+            val response =
+                generatedKeyInfo?.response
+                    ?: KeyMintSecurityLevelInterceptor.getGeneratedKeyResponse(grant.ownerKeyId)
+                    ?: return InterceptorUtils.createErrorReply(RESPONSE_KEY_NOT_FOUND)
+            return updateResponseSubcomponent(
+                response = response,
+                publicCert = data.createByteArray(),
+                certificateChain = data.createByteArray(),
+                persist = {
+                    if (generatedKeyInfo != null) {
+                        GeneratedKeyPersistence.rePersistIfNeeded(
+                            grant.ownerKeyId.uid,
+                            generatedKeyInfo,
+                        )
+                    }
+                },
+                label = "grant[${descriptor.nspace}] -> ${grant.ownerKeyId}",
+            )
+        }
+
         val generatedKeyInfo =
             when (descriptor.domain) {
                 Domain.KEY_ID ->
@@ -766,15 +804,30 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             return TransactionResult.ContinueAndSkipPost
         }
 
-        SystemLogger.info("Updating sub-component with key[${generatedKeyInfo.nspace}]")
-        val metadata = generatedKeyInfo.response.metadata
-        val publicCert = data.createByteArray()
-        val certificateChain = data.createByteArray()
+        return updateResponseSubcomponent(
+            response = generatedKeyInfo.response,
+            publicCert = data.createByteArray(),
+            certificateChain = data.createByteArray(),
+            persist = {
+                GeneratedKeyPersistence.rePersistIfNeeded(callingUid, generatedKeyInfo)
+            },
+            label = "key[${generatedKeyInfo.nspace}]",
+        )
+    }
 
+    private fun updateResponseSubcomponent(
+        response: KeyEntryResponse,
+        publicCert: ByteArray?,
+        certificateChain: ByteArray?,
+        persist: () -> Unit,
+        label: String,
+    ): TransactionResult {
+        SystemLogger.info("Updating sub-component with $label")
+        val metadata = response.metadata
         metadata.certificate = publicCert
         metadata.certificateChain = certificateChain
 
-        GeneratedKeyPersistence.rePersistIfNeeded(callingUid, generatedKeyInfo)
+        persist()
 
         SystemLogger.verbose(
             "Key updated with sizes: [publicCert, certificateChain] = [${publicCert?.size}, ${certificateChain?.size}]"

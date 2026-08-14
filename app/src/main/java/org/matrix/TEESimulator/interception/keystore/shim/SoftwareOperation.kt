@@ -119,6 +119,24 @@ private object JcaAlgorithmMapper {
             }
         return "$keyAlgo/$blockMode/$padding"
     }
+
+    fun mapOaepDigest(digest: Int?): String =
+        when (digest) {
+            Digest.SHA1 -> "SHA-1"
+            Digest.SHA_2_224 -> "SHA-224"
+            Digest.SHA_2_256 -> "SHA-256"
+            Digest.SHA_2_384 -> "SHA-384"
+            Digest.SHA_2_512 -> "SHA-512"
+            else -> "SHA-256"
+        }
+
+    fun mapMacAlgorithm(params: KeyMintAttestation): String =
+        when (params.digest.firstOrNull()) {
+            Digest.SHA_2_256 -> "HmacSHA256"
+            Digest.SHA_2_384 -> "HmacSHA384"
+            Digest.SHA_2_512 -> "HmacSHA512"
+            else -> "HmacSHA256"
+        }
 }
 
 private class Signer(keyPair: KeyPair, params: KeyMintAttestation) : CryptoPrimitive {
@@ -175,6 +193,7 @@ private class CipherPrimitive(
     cryptoKey: java.security.Key,
     params: KeyMintAttestation,
     private val opMode: Int,
+    txId: Long,
 ) : CryptoPrimitive {
     private val isAead = params.blockMode.firstOrNull() == BlockMode.GCM
     private val cipher: Cipher =
@@ -184,6 +203,26 @@ private class CipherPrimitive(
                 init(opMode, cryptoKey, javax.crypto.spec.GCMParameterSpec(128, nonce))
             } else if (nonce != null) {
                 init(opMode, cryptoKey, javax.crypto.spec.IvParameterSpec(nonce))
+            } else if (params.padding.firstOrNull() == PaddingMode.RSA_OAEP) {
+                val mainDigest = JcaAlgorithmMapper.mapOaepDigest(params.digest.firstOrNull())
+                val mgfDigest =
+                    params.rsaOaepMgfDigest.firstOrNull()?.let {
+                        JcaAlgorithmMapper.mapOaepDigest(it)
+                    } ?: mainDigest
+                init(
+                    opMode,
+                    cryptoKey,
+                    javax.crypto.spec.OAEPParameterSpec(
+                        mainDigest,
+                        "MGF1",
+                        java.security.spec.MGF1ParameterSpec(mgfDigest),
+                        javax.crypto.spec.PSource.PSpecified.DEFAULT,
+                    ),
+                )
+                SystemLogger.debug {
+                    "[SoftwareOp TX_ID: $txId] oaep-op main=$mainDigest mgf=$mgfDigest " +
+                        "mode=${if (opMode == Cipher.DECRYPT_MODE) "decrypt" else "encrypt"}"
+                }
             } else {
                 init(opMode, cryptoKey)
             }
@@ -240,6 +279,53 @@ private class KeyAgreementPrimitive(keyPair: KeyPair) : CryptoPrimitive {
     override fun abort() {}
 }
 
+private class MacPrimitive(
+    secretKey: javax.crypto.SecretKey,
+    private val params: KeyMintAttestation,
+    private val txId: Long,
+) : CryptoPrimitive {
+    private val mac: javax.crypto.Mac =
+        javax.crypto.Mac.getInstance(JcaAlgorithmMapper.mapMacAlgorithm(params)).apply {
+            init(secretKey)
+        }
+
+    override fun update(data: ByteArray?): ByteArray? {
+        if (data != null) mac.update(data)
+        return null
+    }
+
+    override fun finish(data: ByteArray?, signature: ByteArray?): ByteArray? {
+        if (data != null) mac.update(data)
+        val full = mac.doFinal()
+        // Tag.MAC_LENGTH is optional on the AndroidKeyStore Mac SPI; default to the
+        // full digest length so real Mac use keeps working when it is omitted.
+        val tagBytes = (params.macLength ?: (full.size * 8)) / 8
+        val tag = full.copyOf(tagBytes)
+        if (params.purpose.firstOrNull() == KeyPurpose.VERIFY) {
+            if (signature == null) {
+                throw ServiceSpecificException(
+                    KeystoreErrorCodes.verificationFailed,
+                    "MAC to verify is null",
+                )
+            }
+            if (!java.security.MessageDigest.isEqual(tag, signature)) {
+                throw ServiceSpecificException(
+                    KeystoreErrorCodes.verificationFailed,
+                    "MAC verification failed",
+                )
+            }
+            return null
+        }
+        SystemLogger.debug {
+            "[SoftwareOp TX_ID: $txId] hmac-op digest=${params.digest.firstOrNull()} " +
+                "macLen=${params.macLength} tag=${tag.size}B result=ok"
+        }
+        return tag
+    }
+
+    override fun abort() {}
+}
+
 class SoftwareOperation(
     private val txId: Long,
     keyPair: KeyPair?,
@@ -288,59 +374,75 @@ class SoftwareOperation(
         }
 
         primitive =
-            when (purpose) {
-                KeyPurpose.SIGN -> {
-                    val kp =
-                        keyPair
-                            ?: throw ServiceSpecificException(
-                                KeystoreErrorCodes.invalidArgument,
-                                "[SoftwareOp TX_ID: $txId] SIGN requested but keyPair is null",
-                            )
-                    Signer(kp, params)
+            if (params.algorithm == Algorithm.HMAC) {
+                // An HMAC key is symmetric (secretKey set, keyPair null), so it must
+                // not fall through to the purpose-keyed Signer/Verifier paths, which
+                // require a keyPair. secretKey is populated at HMAC keygen and restore,
+                // so the throw is a defensive floor, not a live path.
+                MacPrimitive(
+                    secretKey
+                        ?: throw ServiceSpecificException(
+                            KeystoreErrorCodes.invalidArgument,
+                            "[SoftwareOp TX_ID: $txId] HMAC op but secretKey null",
+                        ),
+                    params,
+                    txId,
+                )
+            } else {
+                when (purpose) {
+                    KeyPurpose.SIGN -> {
+                        val kp =
+                            keyPair
+                                ?: throw ServiceSpecificException(
+                                    KeystoreErrorCodes.invalidArgument,
+                                    "[SoftwareOp TX_ID: $txId] SIGN requested but keyPair is null",
+                                )
+                        Signer(kp, params)
+                    }
+                    KeyPurpose.VERIFY -> {
+                        val kp =
+                            keyPair
+                                ?: throw ServiceSpecificException(
+                                    KeystoreErrorCodes.invalidArgument,
+                                    "[SoftwareOp TX_ID: $txId] VERIFY requested but keyPair is null",
+                                )
+                        Verifier(kp, params)
+                    }
+                    KeyPurpose.ENCRYPT -> {
+                        val key: java.security.Key =
+                            secretKey
+                                ?: keyPair?.public
+                                ?: throw ServiceSpecificException(
+                                    KeystoreErrorCodes.unsupportedPurpose,
+                                    "[SoftwareOp TX_ID: $txId] ENCRYPT requires either secretKey or keyPair.public",
+                                )
+                        CipherPrimitive(key, params, Cipher.ENCRYPT_MODE, txId)
+                    }
+                    KeyPurpose.DECRYPT -> {
+                        val key: java.security.Key =
+                            secretKey
+                                ?: keyPair?.private
+                                ?: throw ServiceSpecificException(
+                                    KeystoreErrorCodes.unsupportedPurpose,
+                                    "[SoftwareOp TX_ID: $txId] DECRYPT requires either secretKey or keyPair.private",
+                                )
+                        CipherPrimitive(key, params, Cipher.DECRYPT_MODE, txId)
+                    }
+                    KeyPurpose.AGREE_KEY -> {
+                        val kp =
+                            keyPair
+                                ?: throw ServiceSpecificException(
+                                    KeystoreErrorCodes.invalidArgument,
+                                    "[SoftwareOp TX_ID: $txId] AGREE_KEY requested but keyPair is null",
+                                )
+                        KeyAgreementPrimitive(kp)
+                    }
+                    else ->
+                        throw ServiceSpecificException(
+                            KeystoreErrorCodes.unsupportedPurpose,
+                            "Unsupported operation purpose: $purpose",
+                        )
                 }
-                KeyPurpose.VERIFY -> {
-                    val kp =
-                        keyPair
-                            ?: throw ServiceSpecificException(
-                                KeystoreErrorCodes.invalidArgument,
-                                "[SoftwareOp TX_ID: $txId] VERIFY requested but keyPair is null",
-                            )
-                    Verifier(kp, params)
-                }
-                KeyPurpose.ENCRYPT -> {
-                    val key: java.security.Key =
-                        secretKey
-                            ?: keyPair?.public
-                            ?: throw ServiceSpecificException(
-                                KeystoreErrorCodes.unsupportedPurpose,
-                                "[SoftwareOp TX_ID: $txId] ENCRYPT requires either secretKey or keyPair.public",
-                            )
-                    CipherPrimitive(key, params, Cipher.ENCRYPT_MODE)
-                }
-                KeyPurpose.DECRYPT -> {
-                    val key: java.security.Key =
-                        secretKey
-                            ?: keyPair?.private
-                            ?: throw ServiceSpecificException(
-                                KeystoreErrorCodes.unsupportedPurpose,
-                                "[SoftwareOp TX_ID: $txId] DECRYPT requires either secretKey or keyPair.private",
-                            )
-                    CipherPrimitive(key, params, Cipher.DECRYPT_MODE)
-                }
-                KeyPurpose.AGREE_KEY -> {
-                    val kp =
-                        keyPair
-                            ?: throw ServiceSpecificException(
-                                KeystoreErrorCodes.invalidArgument,
-                                "[SoftwareOp TX_ID: $txId] AGREE_KEY requested but keyPair is null",
-                            )
-                    KeyAgreementPrimitive(kp)
-                }
-                else ->
-                    throw ServiceSpecificException(
-                        KeystoreErrorCodes.unsupportedPurpose,
-                        "Unsupported operation purpose: $purpose",
-                    )
             }
     }
 
@@ -499,6 +601,22 @@ internal object KeystoreErrorCodes {
 
     val unknownError: Int by lazy {
         resolveField("android.hardware.security.keymint.ErrorCode", "UNKNOWN_ERROR", -1000)
+    }
+
+    val incompatibleBlockMode: Int by lazy {
+        resolveField("android.hardware.security.keymint.ErrorCode", "INCOMPATIBLE_BLOCK_MODE", -8)
+    }
+
+    val incompatiblePaddingMode: Int by lazy {
+        resolveField("android.hardware.security.keymint.ErrorCode", "INCOMPATIBLE_PADDING_MODE", -11)
+    }
+
+    val incompatibleDigest: Int by lazy {
+        resolveField("android.hardware.security.keymint.ErrorCode", "INCOMPATIBLE_DIGEST", -13)
+    }
+
+    val invalidMacLength: Int by lazy {
+        resolveField("android.hardware.security.keymint.ErrorCode", "INVALID_MAC_LENGTH", -57)
     }
 
     fun resolveField(className: String, fieldName: String, fallback: Int): Int =

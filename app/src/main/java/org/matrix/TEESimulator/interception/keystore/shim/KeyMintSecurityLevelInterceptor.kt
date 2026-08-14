@@ -2,6 +2,7 @@ package org.matrix.TEESimulator.interception.keystore.shim
 
 import android.hardware.security.keymint.Algorithm
 import android.hardware.security.keymint.BlockMode
+import android.hardware.security.keymint.Digest
 import android.hardware.security.keymint.EcCurve
 import android.hardware.security.keymint.KeyOrigin
 import android.hardware.security.keymint.KeyParameter
@@ -457,8 +458,13 @@ class KeyMintSecurityLevelInterceptor(
                             digest = parsedParams.digest.ifEmpty { keyParams.digest },
                             blockMode = parsedParams.blockMode.ifEmpty { keyParams.blockMode },
                             padding = parsedParams.padding.ifEmpty { keyParams.padding },
+                            rsaOaepMgfDigest =
+                                parsedParams.rsaOaepMgfDigest.ifEmpty {
+                                    keyParams.rsaOaepMgfDigest
+                                },
                             nonce = parsedParams.nonce,
                             minMacLength = parsedParams.minMacLength ?: keyParams.minMacLength,
+                            macLength = parsedParams.macLength,
                         )
                     } else parsedParams
 
@@ -798,7 +804,12 @@ class KeyMintSecurityLevelInterceptor(
             val algoName =
                 when (parsedParams.algorithm) {
                     Algorithm.AES -> "AES"
-                    Algorithm.HMAC -> "HmacSHA256"
+                    Algorithm.HMAC ->
+                        when (parsedParams.digest.firstOrNull()) {
+                            Digest.SHA_2_384 -> "HmacSHA384"
+                            Digest.SHA_2_512 -> "HmacSHA512"
+                            else -> "HmacSHA256"
+                        }
                     else ->
                         throw android.os.ServiceSpecificException(
                             KEYMINT_INVALID_ARGUMENT,
@@ -892,7 +903,16 @@ class KeyMintSecurityLevelInterceptor(
         // signed by the attest key the caller chains to via getCertChain, never silently re-rooted
         // under the keybox (which double-roots the assembled chain and fails verification).
         val attestKeyAlias: String? =
-            attestationKey?.let { it.alias ?: findGeneratedAliasByKeyId(callingUid, it.nspace) }
+            attestationKey?.let {
+                if (it.domain == Domain.GRANT)
+                    resolveGrant(it.nspace, callingUid)?.ownerKeyId?.alias
+                else it.alias ?: findGeneratedAliasByKeyId(callingUid, it.nspace)
+            }
+        if (attestationKey != null && attestationKey.domain == Domain.GRANT) {
+            SystemLogger.uidLog(callingUid, txId, "attest-grant") {
+                "grantId=${attestationKey.nspace} → signer=$attestKeyAlias"
+            }
+        }
         if (attestationKey != null && attestKeyAlias == null) {
             throw android.os.ServiceSpecificException(
                 KEYMINT_INVALID_ARGUMENT,

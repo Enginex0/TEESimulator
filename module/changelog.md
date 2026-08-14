@@ -3,6 +3,38 @@
 
 ---
 
+## TEESimulator-RS v6.0.1-307
+
+Fixes five gaps in the module's TEE key-operation and attestation emulation. Two of them fix crashes in real app crypto on a broken-TEE device: any app using an AndroidKeyStore HMAC key or an RSA-OAEP-SHA256 key was throwing. This is a beta; the confirmation logs are in the debug build only, and nothing is field-verified yet.
+
+### App crypto correctness
+- HMAC operations now run instead of throwing. An AndroidKeyStore HMAC key is symmetric, so an HMAC SIGN fell into the asymmetric SIGN path and failed on a null key pair, and no MAC primitive existed. SIGN and VERIFY now work: the tag is computed with Mac (HmacSHA256/384/512), truncated to the requested MAC_LENGTH (full digest when unspecified), and checked with a constant-time compare.
+- RSA-OAEP-SHA256 decrypt no longer fails with BadPaddingException. The cipher ran with no OAEPParameterSpec, so JCA fell back to SHA-1 and rejected SHA-256 ciphertext. It now applies the correct main and MGF1 digests. A key that authorizes several MGF1 digests uses the one the operation requested, not the key's first.
+- Grant-domain attestation keys now resolve. A self-granted PURPOSE_ATTEST_KEY (a Domain.GRANT descriptor) could not resolve its signer alias, so generateKey failed and the subject key was never stored, returning KEY_NOT_FOUND on readback. The grant now resolves to the owner key's alias, and the subject key stays readable under Domain.APP.
+
+### Supplementary attestation
+- MODULE_HASH now comes from the framework's own getSupplementaryAttestationInfo, so it matches the value a verifier computes. It falls back to local re-derivation when that API is unreachable.
+
+### Diagnostics (debug builds only)
+- New per-operation (oaep-op, hmac-op, attest-grant) and device-level (module-hash, vintf-version) source logs. R8 strips them from release builds.
+
+### 中文说明
+
+修复本模块在 TEE 密钥操作与证明模拟中的五处缺陷。其中两处修复的是真实应用在 TEE 损坏设备上的加密崩溃：任何使用 AndroidKeyStore HMAC 密钥或 RSA-OAEP-SHA256 密钥的应用此前都会抛出异常。本版本为测试版；确认日志仅存在于 debug 构建中，且尚未经过真机验证。
+
+**应用加密正确性**
+- HMAC 操作现在可正常执行，不再抛出异常。AndroidKeyStore 的 HMAC 密钥是对称密钥，因此 HMAC SIGN 此前落入了非对称的 SIGN 分支，并因 key pair 为空而失败，当时也没有 MAC 原语。现在 SIGN 与 VERIFY 均可工作：用 Mac (HmacSHA256/384/512) 计算标签，按请求的 MAC_LENGTH 截断（未指定时取完整摘要长度），并用恒定时间比较进行校验。
+- RSA-OAEP-SHA256 解密不再抛出 BadPaddingException。此前 cipher 未传入 OAEPParameterSpec，JCA 因而回退到 SHA-1 并拒绝 SHA-256 密文。现在会应用正确的主摘要与 MGF1 摘要。若密钥授权了多个 MGF1 摘要，将使用本次操作请求的那个，而非密钥的第一个。
+- Grant 域证明密钥现在可以解析。自授权的 PURPOSE_ATTEST_KEY（Domain.GRANT 描述符）此前无法解析其签名者别名，导致 generateKey 失败且从不存储主体密钥，读取时返回 KEY_NOT_FOUND。现在该 grant 会解析为属主密钥的别名，主体密钥在 Domain.APP 下仍可读取。
+
+**补充证明**
+- MODULE_HASH 现在取自框架自带的 getSupplementaryAttestationInfo，因而与验证方计算出的值一致。当该 API 不可用时，回退到本地重新推导。
+
+**诊断（仅 debug 构建）**
+- 新增按操作 (oaep-op、hmac-op、attest-grant) 与设备级 (module-hash、vintf-version) 的来源日志。R8 会在 release 构建中将其剥离。
+
+---
+
 ## TEESimulator-RS v6.0.1-282
 
 AUTO-mode key attestation now forges plain attestation from the keybox instead of deferring to the real TEE.

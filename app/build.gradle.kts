@@ -28,7 +28,14 @@ abstract class GitExecutor @Inject constructor(private val execOperations: ExecO
 // Instantiate the helper class using Gradle's object factory
 val gitExecutor = objects.newInstance(GitExecutor::class.java)
 
-val gitCommitCount = gitExecutor.execute("git rev-list HEAD --count", rootDir).toInt()
+// versionCode = git commit count + floor offset. The 2026-07-08 public-release
+// history scrub (0f1143a) rewrote history and dropped the raw commit count below
+// the build number already shipped to testers (298), so post-scrub counts read as
+// downgrades. The floor offset lifts versionCode back above that peak and keeps it
+// monotonic across the rewrite; each later commit still bumps it by one.
+val versionCodeFloorOffset = 5
+val gitCommitCount =
+    gitExecutor.execute("git rev-list HEAD --count", rootDir).toInt() + versionCodeFloorOffset
 val gitCommitHash = gitExecutor.execute("git rev-parse --verify --short HEAD", rootDir)
 val verName = "v6.0.1"
 

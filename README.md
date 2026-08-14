@@ -114,6 +114,12 @@ boot=no
 system=2025-10-01
 ```
 
+### boot_props_mode
+
+Controls global `ro.boot.*` property spoofing. Values: `auto` (default), `force`, or `disable`.
+
+In `auto`, Oplus-family devices (OnePlus/OPPO/realme/Oplus) skip boot-state prop spoofing to avoid conflicts with vendor TEE services such as ultrasonic fingerprint calibration. Create `/data/adb/tricky_store/boot_props_mode` with `force` to restore the old behavior, or `disable` to turn it off on any device.
+
 ## Building from source
 
 You need JDK 21, the Android SDK and NDK 29, Rust (stable) with the `aarch64-linux-android` target, and `cargo-ndk`.

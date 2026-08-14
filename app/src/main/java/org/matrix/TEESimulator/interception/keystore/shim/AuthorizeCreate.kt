@@ -1,8 +1,10 @@
 package org.matrix.TEESimulator.interception.keystore.shim
 
 import android.hardware.security.keymint.Algorithm
+import android.hardware.security.keymint.BlockMode
 import android.hardware.security.keymint.KeyParameter
 import android.hardware.security.keymint.KeyPurpose
+import android.hardware.security.keymint.PaddingMode
 import android.hardware.security.keymint.Tag
 import org.matrix.TEESimulator.attestation.KeyMintAttestation
 
@@ -18,6 +20,7 @@ object AuthorizeCreate {
         // Algorithm-level rejection runs before purpose-list check (AOSP HAL behavior)
         return checkAlgorithmPurpose(keyParams, purpose)
             ?: checkPurpose(keyParams, purpose)
+            ?: checkOperationAuthorizations(keyParams, opParams)
             ?: checkTemporalValidity(keyParams, purpose)
             ?: checkCallerNonce(keyParams, purpose, rawOpParams)
     }
@@ -38,6 +41,46 @@ object AuthorizeCreate {
     private fun checkPurpose(keyParams: KeyMintAttestation, purpose: Int): Int? {
         if (purpose == KeyPurpose.WRAP_KEY) return KeystoreErrorCodes.incompatiblePurpose
         if (purpose !in keyParams.purpose) return KeystoreErrorCodes.incompatiblePurpose
+        return null
+    }
+
+    private fun checkOperationAuthorizations(
+        keyParams: KeyMintAttestation,
+        opParams: KeyMintAttestation,
+    ): Int? {
+        if (opParams.blockMode.any { it !in keyParams.blockMode }) {
+            return KeystoreErrorCodes.incompatibleBlockMode
+        }
+        if (opParams.padding.any { it !in keyParams.padding }) {
+            return KeystoreErrorCodes.incompatiblePaddingMode
+        }
+        if (opParams.digest.any { it !in keyParams.digest }) {
+            return KeystoreErrorCodes.incompatibleDigest
+        }
+        if (opParams.rsaOaepMgfDigest.any { it !in keyParams.rsaOaepMgfDigest }) {
+            return KeystoreErrorCodes.incompatibleDigest
+        }
+
+        if (keyParams.algorithm == Algorithm.AES && opParams.blockMode.contains(BlockMode.GCM)) {
+            val requestedMacLength = opParams.minMacLength
+            val keyMinMacLength = keyParams.minMacLength
+            if (
+                requestedMacLength != null &&
+                    keyMinMacLength != null &&
+                    requestedMacLength < keyMinMacLength
+            ) {
+                return KeystoreErrorCodes.invalidMacLength
+            }
+        }
+
+        if (
+            keyParams.algorithm == Algorithm.RSA &&
+                opParams.padding.contains(PaddingMode.RSA_OAEP) &&
+                opParams.digest.isEmpty()
+        ) {
+            return KeystoreErrorCodes.incompatibleDigest
+        }
+
         return null
     }
 

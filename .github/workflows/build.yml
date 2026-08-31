@@ -16,6 +16,11 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      # Direct (archive:false) uploads name the artifact after the file, so the
+      # release job can download each zip by its exact, deterministic name.
+      release_name: ${{ steps.artifacts.outputs.release_name }}
+      debug_name: ${{ steps.artifacts.outputs.debug_name }}
 
     steps:
       - uses: actions/checkout@v4
@@ -74,25 +79,37 @@ jobs:
           echo "version=${ver}-${count}" >> "$GITHUB_OUTPUT"
 
       - name: List build artifacts
+        id: artifacts
         run: |
-          echo "Release: $(ls out/*Release*.zip | head -1) ($(du -h out/*Release*.zip | head -1 | cut -f1))"
-          echo "Debug: $(ls out/*Debug*.zip | head -1) ($(du -h out/*Debug*.zip | head -1 | cut -f1))"
+          release="$(ls out/*Release*.zip | head -1)"
+          debug="$(ls out/*Debug*.zip | head -1)"
+          if [[ -n "${release}" && -n "${debug}" ]];
+          then
+            echo "Release: ${release} ($(du -h "${release}" | cut -f1))"
+            echo "Debug: ${debug} ($(du -h "${debug}" | cut -f1))"
+            echo "release=${release}" >> "${GITHUB_OUTPUT}"
+            echo "debug=${debug}" >> "${GITHUB_OUTPUT}"
+            # The direct (archive:false) uploads below are named after these
+            # basenames; export them so the release job can download by name.
+            echo "release_name=$(basename "${release}")" >> "${GITHUB_OUTPUT}"
+            echo "debug_name=$(basename "${debug}")" >> "${GITHUB_OUTPUT}"
+          else
+            exit 1
+          fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
-          name: TEESimulator-RS-release-zip
-          path: out/TEESimulator-RS-*-Release.zip
+          path: ${{ steps.artifacts.outputs.release }}
           retention-days: 30
-          compression-level: 0
+          archive: false
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
-          name: TEESimulator-RS-debug-zip
-          path: out/TEESimulator-RS-*-Debug.zip
+          path: ${{ steps.artifacts.outputs.debug }}
           retention-days: 7
-          compression-level: 0
+          archive: false
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-mappings
           path: app/build/outputs/mapping/release
@@ -117,15 +134,28 @@ jobs:
           count=$(git rev-list HEAD --count)
           echo "version=${ver}-${count}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/download-artifact@v4
+      # The zips are direct (archive:false) uploads whose artifact names equal
+      # the file basenames, which the build job exports as outputs. Download
+      # each by that exact name. Their blob URLs still end in .zip, which makes
+      # the default download path EXTRACT the module zip itself;
+      # skip-decompress keeps the raw file so it lands in zips/ unchanged.
+      - uses: actions/download-artifact@v8
         with:
-          name: TEESimulator-RS-release-zip
+          name: ${{ needs.build.outputs.release_name }}
           path: zips
+          skip-decompress: true
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
-          name: TEESimulator-RS-debug-zip
+          name: ${{ needs.build.outputs.debug_name }}
           path: zips
+          skip-decompress: true
+
+      - name: Verify module zips
+        run: |
+          ls -la zips/
+          test -f "zips/${{ needs.build.outputs.release_name }}"
+          test -f "zips/${{ needs.build.outputs.debug_name }}"
 
       - name: Extract changelog
         run: |
@@ -138,14 +168,12 @@ jobs:
       - name: Create release
         run: |
           gh release delete "$VER" --yes 2>/dev/null || true
-          RELEASE=$(ls zips/*Release*.zip | head -1)
-          DEBUG=$(ls zips/*Debug*.zip | head -1)
           gh release create "$VER" \
             --title "$VER" \
             --latest \
             --notes-file /tmp/notes.md \
-            "$RELEASE" \
-            "$DEBUG"
+            "zips/${{ needs.build.outputs.release_name }}" \
+            "zips/${{ needs.build.outputs.debug_name }}"
         env:
           VER: ${{ steps.ver.outputs.version }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -153,8 +181,7 @@ jobs:
       - name: Bump update.json
         run: |
           COUNT=$(git rev-list HEAD --count)
-          RELEASE_NAME=$(basename zips/*Release*.zip)
-          ZIP_URL="https://github.com/${{ github.repository }}/releases/download/${VER}/${RELEASE_NAME}"
+          ZIP_URL="https://github.com/${{ github.repository }}/releases/download/${VER}/${{ needs.build.outputs.release_name }}"
           jq ".versionCode = $COUNT | .zipUrl = \"$ZIP_URL\"" module/update.json > /tmp/update.json
           mv /tmp/update.json module/update.json
           git config user.name "github-actions[bot]"

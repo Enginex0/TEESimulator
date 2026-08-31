@@ -64,7 +64,9 @@ object App {
             NativeCertGen.initialize("/data/adb/modules/tricky_store/libcertgen.so")
 
             // Mount the SOTER forge on the on-demand soterserver process. The supervisor
-            // binds and (re)injects on its own thread, returning at once so it never blocks the loop.
+            // binds and (re)injects on its own thread, returning at once so it never blocks the
+            // loop; the first bind is deferred until sys.boot_completed so the boot window is
+            // never disturbed (issue #48).
             SoterProcessSupervisor.start(systemContext)
 
             // This starts the message queue processing. It blocks here indefinitely

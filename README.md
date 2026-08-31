@@ -120,6 +120,10 @@ Controls global `ro.boot.*` property spoofing. Values: `auto` (default), `force`
 
 In `auto`, Oplus-family devices (OnePlus/OPPO/realme/Oplus) skip boot-state prop spoofing to avoid conflicts with vendor TEE services such as ultrasonic fingerprint calibration. Create `/data/adb/tricky_store/boot_props_mode` with `force` to restore the old behavior, or `disable` to turn it off on any device.
 
+### disable_soter_forge
+
+The SOTER forge (WeChat fingerprint-pay compatibility shim) mounts onto the on-demand `com.tencent.soter.soterserver` process. It never binds during the boot window — the first bind is deferred until `sys.boot_completed` — and it disables itself when the package is absent. If it still misbehaves on a given ROM, create an empty `/data/adb/tricky_store/disable_soter_forge` file to turn the forge off entirely.
+
 ## Building from source
 
 You need JDK 21, the Android SDK and NDK 29, Rust (stable) with the `aarch64-linux-android` target, and `cargo-ndk`.
